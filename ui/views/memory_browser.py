@@ -38,21 +38,24 @@ def render():
     st.progress(pct, text=f"Token budget: {used:,} / {MAX_TOTAL_TOKENS:,} ({pct:.1%})")
 
     # Filters
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         cats = ["(all)", "preference", "fact", "insight", "decision",
-                "project_status", "relationship", "skill", "constraint"]
+                "project_status", "relationship", "skill", "constraint",
+                "procedural", "episodic"]
         category_filter = st.selectbox("Category", cats)
     with col2:
         importance_filter = st.selectbox("Importance", ["(all)", "low", "medium", "high", "critical"])
     with col3:
-        sort_by = st.selectbox("Sort by", ["relevance_score", "created_at", "access_count"])
+        sort_by = st.selectbox("Sort by", ["relevance_score", "created_at", "access_count", "confidence"])
+    with col4:
+        min_conf = st.slider("Min Confidence", 0.0, 1.0, 0.0, 0.05)
 
     search_query = st.text_input("Search content", placeholder="Type to filter…")
 
     # Fetch memories
     cat_arg = None if category_filter == "(all)" else category_filter
-    memories = store.get_memories(profile, category=cat_arg)
+    memories = store.get_memories(profile, category=cat_arg, min_confidence=min_conf)
 
     # Client-side filters
     if importance_filter != "(all)":
@@ -64,10 +67,10 @@ def render():
     # Sort. Use a type-matched default so a row missing the field doesn't mix
     # str and int and raise TypeError (#114): numeric fields default to 0,
     # string date fields to "".
-    numeric_sort = sort_by in ("relevance_score", "access_count")
+    numeric_sort = sort_by in ("relevance_score", "access_count", "confidence")
     reverse = numeric_sort
-    default = 0 if numeric_sort else ""
-    memories = sorted(memories, key=lambda m: m.get(sort_by, default), reverse=reverse)
+    default = 0.0 if numeric_sort else ""
+    memories = sorted(memories, key=lambda m: m.get(sort_by, default) or default, reverse=reverse)
 
     st.caption(f"{len(memories)} memories shown")
     st.divider()
@@ -85,7 +88,9 @@ def render():
                 # (e.g. a beacon image firing on page load) (#86). Badges are
                 # our own trusted strings.
                 st.text(mem["content"])
-                st.markdown(f"`{mem.get('category', '')}` `{mem.get('importance', '')}`")
+                conf_val = mem.get("confidence", 1.0)
+                expires_str = f" · Expires: {mem['expires_at'][:10]}" if mem.get("expires_at") else ""
+                st.markdown(f"`{mem.get('category', '')}` `{mem.get('importance', '')}` `Confidence: {conf_val:.2f}`{expires_str}")
                 st.caption(
                     f"ID: {mem['id']} · "
                     f"Score: {mem.get('relevance_score', 0):.2f} · "

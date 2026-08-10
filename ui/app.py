@@ -70,6 +70,7 @@ _require_auth()
 PAGES = {
     "🚩 Flagged Queue": "flagged_queue",
     "🧠 Memory Browser": "memory_browser",
+    "🕸️ Knowledge Graph": "graph_view",
     "📊 Analytics": "analytics",
     "🔄 Portability": "portability",
 }
@@ -86,6 +87,8 @@ if module_name == "flagged_queue":
     from ui.views.flagged_queue import render
 elif module_name == "memory_browser":
     from ui.views.memory_browser import render
+elif module_name == "graph_view":
+    from ui.views.graph_view import render
 elif module_name == "analytics":
     from ui.views.analytics import render
 elif module_name == "portability":

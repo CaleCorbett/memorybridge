@@ -48,7 +48,11 @@ CREATE TABLE IF NOT EXISTS memories (
     -- useful when you already trust your own multi-agent setup (Hermes,
     -- a future second local agent) but not a substitute for real per-client
     -- auth. Sanitized (lowercase, [a-z0-9_-], <=32 chars) on write.
-    client_name    TEXT
+    client_name    TEXT,
+    -- 2026 Memory Engineering additions (v5.0)
+    confidence     REAL NOT NULL DEFAULT 1.0,
+    expires_at     TEXT,
+    status         TEXT NOT NULL DEFAULT 'active'
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_content_hash
@@ -57,6 +61,16 @@ CREATE INDEX IF NOT EXISTS idx_profile_cat
     ON memories(profile, category) WHERE archived = 0;
 CREATE INDEX IF NOT EXISTS idx_profile_score
     ON memories(profile, relevance_score DESC) WHERE archived = 0;
+
+CREATE TABLE IF NOT EXISTS memory_edges (
+    id           TEXT PRIMARY KEY,
+    source_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    target_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    relation     TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_edge_source ON memory_edges(source_id);
+CREATE INDEX IF NOT EXISTS idx_edge_target ON memory_edges(target_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     content,
@@ -98,7 +112,8 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-INSERT OR IGNORE INTO meta VALUES ('schema_version', '4.0');
+INSERT OR IGNORE INTO meta VALUES ('schema_version', '5.0');
+UPDATE meta SET value = '5.0' WHERE key = 'schema_version';
 
 -- Phase 4: embedding vectors stored as JSON float arrays (no native extension needed)
 CREATE TABLE IF NOT EXISTS memory_embeddings (

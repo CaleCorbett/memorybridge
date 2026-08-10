@@ -284,7 +284,8 @@ def compress_memory(mem: dict, target_tokens: int = 50) -> dict:
 # =============================================================================
 
 _RESULT_FIELDS = {"id", "content", "category", "importance",
-                  "project_id", "tags", "token_count", "created_at", "client_name"}
+                  "project_id", "tags", "token_count", "created_at", "client_name",
+                  "confidence", "expires_at", "status", "source"}
 
 
 def _clean_result(mem: dict) -> dict:
@@ -302,7 +303,8 @@ def get_memory(
     context_hint: Optional[str] = None,
     category: Optional[str] = None,
     max_tokens: int = MAX_TOKENS_DEFAULT,
-    compress: bool = True
+    compress: bool = True,
+    min_confidence: float = 0.0
 ) -> str:
     """
     Retrieve relevant memory slice within token budget.
@@ -313,6 +315,7 @@ def get_memory(
         category: Optional category filter
         max_tokens: Maximum tokens to return (default 4000)
         compress: Whether to compress memories to fit budget (default True)
+        min_confidence: Minimum confidence threshold (default 0.0)
     Returns:
         JSON with memories, token stats, and budget info
     """
@@ -329,19 +332,20 @@ def get_memory(
         # remaining token budget in decay-score order.
         hint_results = _store.search_hybrid(
             profile, context_hint, category=category,
-            limit=20, max_tokens=MAX_TOKENS_DEFAULT
+            limit=20, max_tokens=MAX_TOKENS_DEFAULT,
+            min_confidence=min_confidence
         )
         hint_ids = {m["id"] for m in hint_results}
 
         # Full list for budget fill — apply decay, exclude hint hits (added first)
-        all_memories = _store.get_memories(profile, category=category)
+        all_memories = _store.get_memories(profile, category=category, min_confidence=min_confidence)
         all_memories = apply_decay([m.copy() for m in all_memories], DECAY_CONFIG)
         remainder = [m for m in all_memories if m["id"] not in hint_ids]
         remainder.sort(key=lambda m: m.get("effective_score", 0), reverse=True)
 
         memories = hint_results + remainder
     else:
-        memories = _store.get_memories(profile, category=category)
+        memories = _store.get_memories(profile, category=category, min_confidence=min_confidence)
         memories = apply_decay([m.copy() for m in memories], DECAY_CONFIG)
         memories.sort(key=lambda m: m.get("effective_score", 0), reverse=True)
 
@@ -376,7 +380,7 @@ def get_memory(
         },
     }
     overhead_tokens = (count_tokens(json.dumps(skeleton, indent=2)) +
-                       count_tokens(UNTRUSTED_NOTICE) + 50)
+                       count_tokens(UNTRUSTED_NOTICE) + 60)
     available_for_memories = max(max_tokens - overhead_tokens, 0)
 
     # #179: budget against the REAL serialized cost of each memory as it will
@@ -481,7 +485,10 @@ def add_memory(
     project_id: Optional[str] = None,
     profile: str = None,
     supersedes: list[str] = None,
-    client_name: Optional[str] = None
+    client_name: Optional[str] = None,
+    confidence: float = 1.0,
+    expires_at: Optional[str] = None,
+    status: str = "active"
 ) -> str:
     """
     Add a new memory with automatic token counting and content-hash dedup.
@@ -504,6 +511,9 @@ def add_memory(
             the MEMORYBRIDGE_CLIENT_NAME env var set on this process (a
             durable per-instance default that doesn't depend on the caller
             remembering to pass this argument).
+        confidence: Confidence score between 0.0 and 1.0 (default 1.0)
+        expires_at: Optional ISO timestamp when this memory expires (TTL)
+        status: Status indicator (default 'active')
     Returns:
         Confirmation with memory ID and token count, or duplicate status
     """
@@ -518,7 +528,8 @@ def add_memory(
                                 category=category, importance=importance,
                                 tags=tags, project_id=project_id,
                                 supersedes=supersedes, source=_caller_model(),
-                                client_name=_resolve_client_name(client_name))
+                                client_name=_resolve_client_name(client_name),
+                                confidence=confidence, expires_at=expires_at, status=status)
     except GuardrailRejection as e:
         # Document-shaped content: return the structured error contract every
         # other validation path uses, instead of surfacing an unhandled MCP error.
@@ -719,6 +730,7 @@ def search_memory(
     profile: str = None,
     recency_boost: bool = True,
     include_related: bool = False,
+    min_confidence: float = 0.0,
 ) -> str:
     """
     Search memories using FTS5 BM25 with optional token budget.
@@ -731,6 +743,7 @@ def search_memory(
         profile: Memory profile
         recency_boost: Apply recency weighting (default: true when configured)
         include_related: Include related memories by entity tag overlap (default: false)
+        min_confidence: Minimum confidence threshold (default 0.0)
     Returns:
         JSON with ranked results (internal fields stripped)
     """
@@ -744,7 +757,8 @@ def search_memory(
     results = _store.search_hybrid(profile, query, category=category,
                                    limit=limit, max_tokens=max_tokens,
                                    recency_boost=recency_boost,
-                                   include_related=include_related)
+                                   include_related=include_related,
+                                   min_confidence=min_confidence)
 
     # Boost relevance score for all returned memories in a single commit (issue #12)
     _store.boost_batch(profile, [m["id"] for m in results],
@@ -810,6 +824,110 @@ def reflect(
 
     result = _store.reflect(profile, question, limit=limit, max_tokens=max_tokens)
     return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
+def consolidate_session(
+    session_notes: str,
+    profile: Optional[str] = None,
+    project_id: Optional[str] = None
+) -> str:
+    """
+    Session consolidation tool (Memory Promotion System).
+    Analyzes raw session notes/events, deduplicates against existing store,
+    and synthesizes durable candidate facts, decisions, and procedural rules.
+
+    Args:
+        session_notes: Raw events, tool outputs, or bullet points from the session
+        profile: Memory profile (default: current active profile)
+        project_id: Optional project association
+    Returns:
+        JSON summary of promoted, duplicate, or rejected candidate memories
+    """
+    profile = profile or _active_profile()
+    _store.ensure_profile(profile)
+
+    lines = [ln.strip() for ln in session_notes.splitlines() if ln.strip()]
+    candidates = []
+    for line in lines:
+        if line.startswith(("- ", "* ", "1. ", "2. ", "3. ", "4. ", "5. ")):
+            clean = line.lstrip("-*0123456789. ").strip()
+            if len(clean) > 10:
+                candidates.append(clean)
+    if not candidates:
+        candidates = [session_notes.strip()]
+
+    added = []
+    duplicates = []
+    rejected = []
+
+    for candidate in candidates[:5]:  # Max 5 promotions per session
+        cat = "procedural" if any(w in candidate.lower() for w in ["step", "fix", "workflow", "how to", "use ", "command", "requires"]) else "fact"
+        try:
+            mid = _store.add_memory(
+                profile, candidate,
+                category=cat,
+                importance="high",
+                project_id=project_id,
+                source=_caller_model(),
+                confidence=0.9
+            )
+            if mid:
+                added.append({"memory_id": mid, "content": candidate, "category": cat})
+            else:
+                duplicates.append(candidate)
+        except GuardrailRejection as e:
+            rejected.append({"content": candidate, "reason": str(e)})
+
+    _store.log_access("consolidate_session", profile, f"added={len(added)}, duplicates={len(duplicates)}, rejected={len(rejected)}")
+    return json.dumps({
+        "status": "consolidated",
+        "profile": profile,
+        "added_count": len(added),
+        "duplicate_count": len(duplicates),
+        "rejected_count": len(rejected),
+        "promoted_memories": added,
+        "rejected": rejected
+    }, indent=2)
+
+
+@mcp.tool()
+def add_memory_edge(
+    source_id: str,
+    target_id: str,
+    relation: str = "relates_to"
+) -> str:
+    """
+    Create a directed knowledge graph edge between two memories.
+
+    Args:
+        source_id: Origin memory ID
+        target_id: Target memory ID
+        relation: Relation tag (e.g. 'supersedes', 'depends_on', 'relates_to', 'part_of')
+    Returns:
+        JSON confirmation with new edge ID
+    """
+    try:
+        edge_id = _store.add_edge(source_id, target_id, relation=relation)
+        return json.dumps({"status": "edge_created", "edge_id": edge_id, "source_id": source_id, "target_id": target_id, "relation": relation}, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_memory_edges(
+    memory_id: str
+) -> str:
+    """
+    Retrieve knowledge graph edges connected to a memory.
+
+    Args:
+        memory_id: Memory ID to query
+    Returns:
+        JSON list of connected edges
+    """
+    edges = _store.get_edges(memory_id)
+    return json.dumps({"memory_id": memory_id, "edges": edges, "count": len(edges)}, indent=2)
 
 
 @mcp.tool()

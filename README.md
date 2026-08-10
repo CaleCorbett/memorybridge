@@ -102,11 +102,15 @@ Claude calls these automatically — no special syntax required.
 
 | Tool | Description |
 | --- | --- |
-| `get_memory` | Retrieve memories within a token budget, ranked by decay-adjusted relevance |
-| `add_memory` | Add a single memory with category and importance |
+| `get_memory` | Retrieve memories within a token budget, ranked by decay-adjusted relevance (supports `min_confidence`) |
+| `add_memory` | Add a single memory with category, importance, `confidence`, and optional `expires_at` TTL |
 | `add_memories` | Batch-add multiple facts in one call (does not mutate existing rows) |
+| `consolidate_session` | **(v5.0)** Synthesize raw session events/logs into durable candidate facts & procedural rules |
+| `add_memory_edge` | **(v5.0)** Create a directed Knowledge Graph edge between two memories (`source_id`, `target_id`, `relation`) |
+| `get_memory_edges` | **(v5.0)** Retrieve Knowledge Graph edge relations connected to a memory |
 | `edit_memory` | Edit content, importance, category, or project association of an existing memory in place |
-| `search_memory` | Hybrid BM25 + semantic search (default: limit=5, max_tokens=800) |
+| `search_memory` | Hybrid BM25 + semantic search (default: limit=5, max_tokens=800, supports `min_confidence`) |
+| `reflect` | Synthesize a reasoned answer from memories with structured sections |
 | `delete_memory` | Remove a memory by ID |
 | `get_token_stats` | Token usage breakdown by profile |
 | `prune_memories` | Archive low-score memories to free budget |
@@ -115,6 +119,21 @@ Claude calls these automatically — no special syntax required.
 | `get_access_log` | Recent read/write history with token stats |
 | `export_for_model` | Export formatted for ChatGPT, Gemini, or Ollama |
 | `export_passport` | Export a plain-text Memory Passport (works with any AI) |
+
+---
+
+## Agent Skill & Maintenance CLI
+
+### Pre-Packaged Agent Skill (`SKILL.md`)
+MemoryBridge includes a pre-packaged Agent Skill at [skills/memorybridge/SKILL.md](skills/memorybridge/SKILL.md) following the `RECALL → PLAN → ACT → OBSERVE → UPDATE` execution loop for Claude Code, Cursor, and Windsurf agents.
+
+### Scheduled Background Maintenance (`mb maintain`)
+Run automated maintenance (TTL expiration purging, duplicate deduplication, and weekly memory health audits):
+
+```bash
+mb maintain --nightly            # Run nightly TTL purge and auto-pruning
+mb maintain --weekly             # Run weekly health check and low-score pruning
+```
 
 ---
 

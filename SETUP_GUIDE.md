@@ -155,7 +155,24 @@ The server (`server.py`) is launched automatically by the Claude desktop app at 
 
 **Do not run `server.py` under a launchd `KeepAlive` job.** The watchdog is designed to kill the server when Claude exits; launchd would immediately restart it, creating a respawn loop. Session-scoped is intentional.
 
-If you previously had a launchd job for the server itself, the retired plist is archived in `~/memorybridge/launchd-retired/`. Only the inbox watcher (`com.memorybridge.inbox.plist`) should be active in `~/Library/LaunchAgents/`.
+If you previously had a launchd job for the server itself, the retired plist is archived in `~/memorybridge/launchd-retired/`. Only the inbox watcher (`com.memorybridge.inbox.plist`) and optional nightly maintenance (`com.memorybridge.maintain.plist`) should be active in `~/Library/LaunchAgents/`.
+
+---
+
+## Scheduled Background Maintenance (`mb maintain`)
+
+To keep your memory store lean, deduplicated, and free of expired temporary items:
+
+```bash
+mb maintain --nightly          # Run nightly TTL cleanup and auto-pruning
+mb maintain --weekly           # Run weekly health report & low-score archiving
+```
+
+To automate nightly maintenance on macOS, copy `launchd/com.memorybridge.maintain.plist.template` to `~/Library/LaunchAgents/com.memorybridge.maintain.plist` (substituting your Python and paths) and run:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.memorybridge.maintain.plist
+```
 
 ---
 

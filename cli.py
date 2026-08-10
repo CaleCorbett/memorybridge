@@ -132,6 +132,51 @@ def cmd_ui(args: argparse.Namespace) -> int:
     return subprocess.call(["streamlit", "run", app], env=dict(os.environ))
 
 
+def cmd_maintain(args: argparse.Namespace) -> int:
+    from datetime import datetime
+    data = config.data_dir()
+    os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
+    from db.store import MemoryStore
+    from db.pruner import run_auto_prune
+    store = MemoryStore(data / "memory.db")
+    profile = args.profile or "default"
+    store.ensure_profile(profile)
+
+    mode = "weekly" if args.weekly else "nightly"
+    print(f"Running MemoryBridge {mode} maintenance for profile '{profile}'...")
+
+    # 1. Purge expired TTL memories
+    now_iso = datetime.now().isoformat()
+    with store._conn.transaction():
+        cur = store._conn.execute(
+            "UPDATE memories SET archived=1, archived_at=?, archive_reason='TTL expired' "
+            "WHERE profile=? AND archived=0 AND expires_at IS NOT NULL AND expires_at < ?",
+            (now_iso, profile, now_iso)
+        )
+        expired_count = cur.rowcount
+        store._conn.commit()
+    print(f"  Expired TTL memories purged: {expired_count}")
+
+    # 2. Dedup / Auto-prune
+    prune_res = run_auto_prune(store._conn, profile, store.delete_memory, allow_auto_delete=True)
+    print(f"  Duplicates / stale auto-pruned: {len(prune_res.get('auto_executed', []))}")
+
+    if args.weekly:
+        # 3. Low-score pruning
+        budget_pruned = store.auto_prune(profile, threshold=0.15)
+        print(f"  Low-score memories archived: {len(budget_pruned)}")
+
+        stats = store.token_stats(profile)
+        edges = store._conn.execute("SELECT COUNT(*) FROM memory_edges").fetchone()[0]
+        print(f"\nWeekly Health Check:")
+        print(f"  Active memories: {stats.get('memory_count', 0)}")
+        print(f"  Total tokens: {stats.get('total_tokens', 0)}")
+        print(f"  Knowledge graph edges: {edges}")
+
+    print("Maintenance complete.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mb", description="MemoryBridge — cross-model memory server")
     sub = p.add_subparsers(dest="command", required=True)
@@ -151,6 +196,13 @@ def build_parser() -> argparse.ArgumentParser:
     ig.set_defaults(func=cmd_ingest)
 
     sub.add_parser("ui", help="launch the Streamlit review UI").set_defaults(func=cmd_ui)
+
+    mt = sub.add_parser("maintain", help="run background maintenance (TTL cleanup, dedup, pruning)")
+    mt.add_argument("--nightly", action="store_true", help="run nightly maintenance (default)")
+    mt.add_argument("--weekly", action="store_true", help="run weekly maintenance & health report")
+    mt.add_argument("--profile", default="default", help="target profile")
+    mt.set_defaults(func=cmd_maintain)
+
     return p
 
 

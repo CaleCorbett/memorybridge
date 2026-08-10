@@ -350,11 +350,14 @@ class MemoryStore:
                    skip_enrichment: bool = False,
                    supersedes: list[str] | None = None,
                    source: str | None = None,
-                   client_name: str | None = None) -> str | None:
+                   client_name: str | None = None,
+                   confidence: float = 1.0,
+                   expires_at: str | None = None,
+                   status: str = "active") -> str | None:
         """Returns memory ID on success, None if exact duplicate.
 
         Raises GuardrailRejection if content is document-shaped (too long, too
-        many lines, or markdown-heading/multi-section). Pass
+        many lines, or markdown-heading/multi-section) or contains secrets. Pass
         enforce_guardrail=False only for trusted internal migrations.
 
         Pass skip_enrichment=True for internal auto-saves (conversation
@@ -417,10 +420,12 @@ class MemoryStore:
                 self._conn.execute(
                     """INSERT INTO memories
                        (id,profile,content,content_hash,category,importance,
-                        created_at,last_accessed,tags,project_id,token_count,source,client_name)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        created_at,last_accessed,tags,project_id,token_count,source,client_name,
+                        confidence,expires_at,status)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (mid, profile, content, h, category, importance,
-                     now, now, json.dumps(enriched_tags or []), project_id, tc, source, client_name)
+                     now, now, json.dumps(enriched_tags or []), project_id, tc, source, client_name,
+                     float(confidence), expires_at, status)
                 )
                 # Supersession: invalidate the facts this one replaces, in the
                 # same transaction so the swap is atomic (#temporal).
@@ -649,10 +654,11 @@ class MemoryStore:
     # -------------------------------------------------------------------------
 
     def get_memories(self, profile: str, category: str = None,
-                     max_tokens: int = None) -> list[dict]:
+                     max_tokens: int = None, min_confidence: float = 0.0) -> list[dict]:
         """Return active memories, ranked by relevance_score desc."""
-        sql = "SELECT * FROM memories WHERE profile=? AND archived=0"
-        params = [profile]
+        now_str = datetime.now().isoformat()
+        sql = "SELECT * FROM memories WHERE profile=? AND archived=0 AND confidence>=? AND (expires_at IS NULL OR expires_at > ?)"
+        params = [profile, min_confidence, now_str]
         if category:
             sql += " AND category=?"
             params.append(category)
@@ -671,7 +677,7 @@ class MemoryStore:
         return mems
 
     def search(self, profile: str, query: str, category: str = None,
-               limit: int = 5, max_tokens: int = 800) -> list[dict]:
+               limit: int = 5, max_tokens: int = 800, min_confidence: float = 0.0) -> list[dict]:
         """FTS5 BM25 search with token budget."""
         # Sanitize each term for FTS5
         terms = [t for t in query.split() if len(t) > 1]
@@ -679,6 +685,7 @@ class MemoryStore:
             return []
         safe_query = " OR ".join(f'"{t}"' for t in terms)
 
+        now_str = datetime.now().isoformat()
         sql = """
             SELECT m.*, bm25(memories_fts) AS bm25_score
             FROM memories_fts
@@ -686,8 +693,10 @@ class MemoryStore:
             WHERE memories_fts MATCH ?
               AND m.profile = ?
               AND m.archived = 0
+              AND m.confidence >= ?
+              AND (m.expires_at IS NULL OR m.expires_at > ?)
         """
-        params = [safe_query, profile]
+        params = [safe_query, profile, min_confidence, now_str]
         if category:
             sql += " AND m.category = ?"
             params.append(category)
@@ -700,9 +709,9 @@ class MemoryStore:
             logging.warning("FTS5 parse error for query %r: %s — falling back to LIKE search", query, fts_err)
             like_pattern = f"%{query}%"
             like_sql = (
-                "SELECT * FROM memories WHERE profile=? AND archived=0 AND content LIKE ?"
+                "SELECT * FROM memories WHERE profile=? AND archived=0 AND confidence>=? AND (expires_at IS NULL OR expires_at > ?) AND content LIKE ?"
             )
-            like_params = [profile, like_pattern]
+            like_params = [profile, min_confidence, now_str, like_pattern]
             if category:
                 like_sql += " AND category=?"
                 like_params.append(category)
@@ -1061,6 +1070,15 @@ class MemoryStore:
             "CREATE INDEX IF NOT EXISTS idx_analytics_model ON analytics_events(model)",
             "CREATE INDEX IF NOT EXISTS idx_prune_queue_candidate ON prune_queue(candidate_id, resolved)",
             "CREATE INDEX IF NOT EXISTS idx_pruner_log_candidate ON pruner_log(candidate_id)",
+            """CREATE TABLE IF NOT EXISTS memory_edges (
+                id           TEXT PRIMARY KEY,
+                source_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                target_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                relation     TEXT NOT NULL,
+                created_at   TEXT NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_edge_source ON memory_edges(source_id)",
+            "CREATE INDEX IF NOT EXISTS idx_edge_target ON memory_edges(target_id)",
         ):
             try:
                 self._conn.execute(ddl)
@@ -1079,6 +1097,12 @@ class MemoryStore:
                 self._conn.execute("ALTER TABLE memories ADD COLUMN source TEXT")
             if "client_name" not in cols:
                 self._conn.execute("ALTER TABLE memories ADD COLUMN client_name TEXT")
+            if "confidence" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0")
+            if "expires_at" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN expires_at TEXT")
+            if "status" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
             pruner_log_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(pruner_log)").fetchall()}
             if pruner_log_cols and "content" not in pruner_log_cols:
                 self._conn.execute("ALTER TABLE pruner_log ADD COLUMN content TEXT")
@@ -1273,7 +1297,8 @@ class MemoryStore:
                       category: str = None,
                       limit: int = 5, max_tokens: int = 800,
                       recency_boost: bool = True,
-                      include_related: bool = False) -> list[dict]:
+                      include_related: bool = False,
+                      min_confidence: float = 0.0) -> list[dict]:
         """
         Reciprocal Rank Fusion of FTS5 BM25 + semantic cosine results.
         RRF score = sum(1 / (60 + rank)) across both lists.
@@ -1282,9 +1307,11 @@ class MemoryStore:
         *recency_boost* — when True (default), applies recency weighting.
         *include_related* — when True (default), expands results with
         entity-tag-related memories.
+        *min_confidence* — filter out memories below confidence threshold.
         """
         keyword_results = self.search(profile, query, category=category,
-                                      limit=limit * 2, max_tokens=max_tokens * 2)
+                                      limit=limit * 2, max_tokens=max_tokens * 2,
+                                      min_confidence=min_confidence)
         semantic_results = self.search_semantic(profile, query, limit=limit * 2,
                                                 max_tokens=max_tokens * 2)
 
@@ -1467,3 +1494,41 @@ class MemoryStore:
             return results
 
         return results + related
+
+    # -------------------------------------------------------------------------
+    # Graph Memory Edges
+    # -------------------------------------------------------------------------
+
+    def add_edge(self, source_id: str, target_id: str, relation: str = "relates_to") -> str:
+        """Create a directed relation edge between two memories."""
+        edge_id = f"edge_{uuid.uuid4().hex[:12]}"
+        now = datetime.now().isoformat()
+        with self._conn.transaction():
+            self._conn.execute(
+                """INSERT INTO memory_edges (id, source_id, target_id, relation, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (edge_id, source_id, target_id, relation, now)
+            )
+            self._conn.commit()
+        return edge_id
+
+    def get_edges(self, memory_id: str) -> list[dict]:
+        """Get graph edges connected to a memory (outgoing and incoming)."""
+        rows = self._conn.execute(
+            """SELECT e.*, m1.content as source_content, m2.content as target_content
+               FROM memory_edges e
+               LEFT JOIN memories m1 ON e.source_id = m1.id
+               LEFT JOIN memories m2 ON e.target_id = m2.id
+               WHERE e.source_id = ? OR e.target_id = ?
+               ORDER BY e.created_at DESC""",
+            (memory_id, memory_id)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_edge(self, edge_id: str) -> bool:
+        """Delete a graph edge by ID."""
+        with self._conn.transaction():
+            cur = self._conn.execute("DELETE FROM memory_edges WHERE id=?", (edge_id,))
+            deleted = cur.rowcount > 0
+            self._conn.commit()
+        return deleted
