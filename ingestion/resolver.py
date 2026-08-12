@@ -11,7 +11,14 @@ logger = logging.getLogger(__name__)
 # Model for conflict resolution. The old "claude-3-5-sonnet-latest" alias was
 # retired by Anthropic and 404s — every escalated fact was being rejected.
 # Override via RESOLVER_MODEL env var when model names change again.
-RESOLVER_MODEL = os.environ.get("RESOLVER_MODEL", "claude-sonnet-4-5")
+#
+# Issue #181 (P2-3): this is a binary accept/reject/merge classification, not
+# open-ended generation, and logs showed Sonnet rejecting 82% of calls
+# (405/496) — i.e. correctly saying "no" to most escalations. Haiku 4.5 is
+# ~3x cheaper and the parser (_parse_verdict) already tolerates its output
+# style (fence-stripping, first-{...}-block fallback), so there's no accuracy
+# reason to pay Sonnet pricing for this call.
+RESOLVER_MODEL = os.environ.get("RESOLVER_MODEL", "claude-haiku-4-5")
 
 SYSTEM_PROMPT = """\
 You are resolving conflicts in a personal AI memory system.
@@ -38,13 +45,22 @@ def _get_client() -> anthropic.Anthropic:
 # Model auto-resolution: model aliases get retired (claude-3-5-sonnet-latest
 # 404'd and silently killed every resolution). Rather than hard-pin and rot,
 # we resolve the model once per run: try RESOLVER_MODEL; if it 404s, query the
-# Models API for the newest available Sonnet and use that. Cached for the run.
+# Models API for the newest available Haiku and use that. Cached for the run.
+#
+# Issue #181 (P2-3): this used to search for "sonnet" here, matching the old
+# Sonnet default above. Now that the default is Haiku (this is a cheap binary
+# accept/reject, not open-ended generation), a 404 fallback searching for
+# "sonnet" would silently jump back to the 3x-more-expensive tier the whole
+# point of this fix was to get off of — so the fallback tier must track the
+# configured tier.
 _RESOLVED_MODEL = None
+_FALLBACK_TIER = "haiku" if "haiku" in RESOLVER_MODEL.lower() else "sonnet"
 
 
 def _pick_model(client: anthropic.Anthropic) -> str:
     """Return a working model id. Prefers RESOLVER_MODEL; auto-falls-back to the
-    newest Sonnet from the Models API if the configured one is unavailable."""
+    newest model of the same tier (Haiku/Sonnet) from the Models API if the
+    configured one is unavailable."""
     global _RESOLVED_MODEL
     if _RESOLVED_MODEL:
         return _RESOLVED_MODEL
@@ -59,7 +75,8 @@ def _pick_model(client: anthropic.Anthropic) -> str:
         return _RESOLVED_MODEL
     except anthropic.NotFoundError as e:
         logger.warning("Configured RESOLVER_MODEL '%s' not found (%s) — "
-                       "auto-selecting newest Sonnet", RESOLVER_MODEL, str(e)[:60])
+                       "auto-selecting newest %s", RESOLVER_MODEL, str(e)[:60],
+                       _FALLBACK_TIER.capitalize())
     except Exception as e:
         # Transient — keep the configured model rather than switching on a blip.
         logger.warning("RESOLVER_MODEL ping failed transiently (%s) — keeping "
@@ -67,17 +84,18 @@ def _pick_model(client: anthropic.Anthropic) -> str:
         _RESOLVED_MODEL = RESOLVER_MODEL
         return _RESOLVED_MODEL
 
-    # 2. Ask the Models API for the newest Sonnet. Sort by created_at rather than
-    #    trusting the list order (which is not a documented guarantee).
+    # 2. Ask the Models API for the newest model in the same tier we were
+    #    configured for. Sort by created_at rather than trusting the list
+    #    order (which is not a documented guarantee).
     try:
         models = client.models.list(limit=50)
-        sonnets = sorted(
-            (m for m in models.data if "sonnet" in m.id.lower()),
+        candidates = sorted(
+            (m for m in models.data if _FALLBACK_TIER in m.id.lower()),
             key=lambda m: getattr(m, "created_at", "") or "",
             reverse=True,
         )
-        if sonnets:
-            _RESOLVED_MODEL = sonnets[0].id
+        if candidates:
+            _RESOLVED_MODEL = candidates[0].id
             logger.warning("Resolver now using auto-selected model: %s", _RESOLVED_MODEL)
             return _RESOLVED_MODEL
     except Exception as e:
@@ -106,14 +124,18 @@ def _build_user_message(fact: dict) -> str:
 
 def _resolve_one(client: anthropic.Anthropic, fact: dict) -> dict:
     """Call Claude and return the verdict dict."""
+    # Issue #181 (P2-2): this used to set cache_control on SYSTEM_PROMPT, but
+    # that prompt is ~200 tokens and Anthropic's minimum cacheable prefix is
+    # 1024 — the API silently ignores cache_control below that floor, so
+    # nothing was ever written to or read from the cache
+    # (usage.cache_read_input_tokens was always 0). Removed rather than kept
+    # as a no-op; if SYSTEM_PROMPT ever grows past ~1024 tokens, re-add
+    # cache_control and verify via usage.cache_read_input_tokens that it's
+    # actually being hit before trusting it.
     msg = client.messages.create(
         model=_pick_model(client),
         max_tokens=256,
-        system=[{
-            "type": "text",
-            "text": SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral"},
-        }],
+        system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": _build_user_message(fact)}],
     )
     raw = msg.content[0].text.strip()

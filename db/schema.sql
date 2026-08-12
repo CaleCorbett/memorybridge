@@ -115,11 +115,14 @@ CREATE TABLE IF NOT EXISTS meta (
 INSERT OR IGNORE INTO meta VALUES ('schema_version', '5.0');
 UPDATE meta SET value = '5.0' WHERE key = 'schema_version';
 
--- Phase 4: embedding vectors stored as JSON float arrays (no native extension needed)
+-- Phase 4: embedding vectors stored as packed float32 BLOBs (issue #181 P2-1).
+-- Previously JSON text, which cost ~81ms of json.loads() parsing per semantic
+-- search across the full profile and inflated DB size (9MB of 12.5MB was
+-- vector JSON). np.frombuffer() on a BLOB is a zero-copy view -- no parsing.
 CREATE TABLE IF NOT EXISTS memory_embeddings (
     id      TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
     profile TEXT NOT NULL,
-    vector  TEXT NOT NULL   -- JSON array of 384 floats (BAAI/bge-small-en-v1.5)
+    vector  BLOB NOT NULL   -- packed float32[384] (BAAI/bge-small-en-v1.5), see db/store.py _pack_vector
 );
 CREATE INDEX IF NOT EXISTS idx_embed_profile ON memory_embeddings(profile);
 

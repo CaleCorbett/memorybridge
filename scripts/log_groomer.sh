@@ -14,6 +14,12 @@ DATA_DIR="${MEMORYBRIDGE_DATA:-$HOME/memorybridge}"
 LOGS=("$DATA_DIR/logs/server.error.log" "$DATA_DIR/logs/http-bridge.error.log")
 LOG_LIMIT_MB=50
 BRIDGE_PORT=8484
+# Issue #181 (P2-6): one-off scripts (backfill-tags.py, backfill-entities.py)
+# each write a timestamped memory.db.bak-<label>-<ts> before mutating the
+# DB, and nothing ever deletes them — 53MB of stale .bak DBs accumulated.
+# Age-gated so a backup made moments ago (e.g. mid-migration) is never
+# touched; only .bak files older than this are considered stale.
+BAK_MAX_AGE_DAYS=14
 
 # --- 1-3. Per-log size check, crash scan (before truncation), truncate ---
 CRASH_HITS=""
@@ -40,6 +46,18 @@ $HITS"
     TRUNCATED_SUMMARY="${TRUNCATED_SUMMARY}${TRUNCATED_SUMMARY:+, }$LOG was $LOG_SIZE_HUMAN"
   fi
 done
+
+# --- 3b. Stale .bak DB cleanup (issue #181) ---
+BAK_DELETED=""
+BAK_DELETED_COUNT=0
+if [ -d "$DATA_DIR" ]; then
+  while IFS= read -r -d '' BAK; do
+    BAK_SIZE_HUMAN=$(du -sh "$BAK" | cut -f1)
+    BAK_DELETED="${BAK_DELETED}${BAK_DELETED:+, }$(basename "$BAK") ($BAK_SIZE_HUMAN)"
+    BAK_DELETED_COUNT=$((BAK_DELETED_COUNT + 1))
+    rm -f "$BAK"
+  done < <(find "$DATA_DIR" -maxdepth 1 -name '*.bak*' -type f -mtime "+${BAK_MAX_AGE_DAYS}" -print0 2>/dev/null)
+fi
 
 # --- 4. Process health check ---
 # Identify the HTTP bridge PID (legitimately runs with PROC_PPID 1)
@@ -83,6 +101,11 @@ fi
 if $TRUNCATED; then
   ISSUES=true
   echo "Log(s) truncated (over ${LOG_LIMIT_MB}MB limit): $TRUNCATED_SUMMARY"
+fi
+
+if [ "$BAK_DELETED_COUNT" -gt 0 ]; then
+  ISSUES=true
+  echo "Deleted $BAK_DELETED_COUNT stale .bak DB file(s) (older than ${BAK_MAX_AGE_DAYS}d): $BAK_DELETED"
 fi
 
 if $ISSUES; then

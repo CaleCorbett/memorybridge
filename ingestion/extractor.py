@@ -122,7 +122,21 @@ def _call_deepseek(client: OpenAI, conversations: list) -> list:
 
     def _attempt() -> Optional[list]:
         resp = client.chat.completions.create(
-            model="deepseek-reasoner",
+            # Issue #181 (P2-4): this task is schema-constrained JSON
+            # extraction against a fixed category/importance whitelist, not
+            # open-ended reasoning — the exact shape that benefits least from
+            # deepseek-reasoner's chain-of-thought premium. deepseek-chat
+            # (DeepSeek-V3.2, non-reasoning) supports the same JSON output
+            # mode at a fraction of the output-token cost. Override via
+            # DEEPSEEK_MODEL if this ever needs revisiting.
+            # Not using response_format={"type": "json_object"}: DeepSeek's
+            # JSON mode (like OpenAI's) is documented against a top-level
+            # JSON *object*, and this schema is a top-level JSON *array* by
+            # design (one entry per extracted fact). The existing
+            # fence-stripping parse below already handles deepseek-chat's
+            # plain-text JSON output reliably — same as it did for
+            # deepseek-reasoner — without that risk.
+            model=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
@@ -256,6 +270,29 @@ def _sanitize_fact(fact: dict) -> Optional[dict]:
     return clean
 
 
+def _is_all_noise_conversation(conv: dict) -> bool:
+    """True if EVERY message in the conversation matches the noise patterns
+    (issue #181 P2-4: "screen the input instead"). Conservative by design —
+    a conversation is only skipped pre-extraction when every single message
+    is ops telemetry; anything mixed with a genuine fact still goes through
+    the model, since per-message noise-matching isn't precise enough to
+    excise just the noisy sentence from a real conversation.
+
+    Previously the noise regexes only ran on the model's *output* fact text,
+    so a conversation that was 100% "disk usage was 47%" / "cron job ran"
+    still paid a full DeepSeek call before the result was thrown away.
+    Screening here skips that API call entirely for the pure-noise case.
+    """
+    messages = conv.get("messages", [])
+    if not messages:
+        return False
+    texts = [m.get("content", "") for m in messages if isinstance(m.get("content"), str)]
+    texts = [t for t in texts if t.strip()]
+    if not texts:
+        return False
+    return all(_is_noise(t) for t in texts)
+
+
 def extract(normalized: dict) -> tuple[list, list]:
     """
     Extract facts from all conversations in a normalized export.
@@ -267,8 +304,9 @@ def extract(normalized: dict) -> tuple[list, list]:
         - facts: flat list of extracted fact dicts, each tagged with
           source_conversation_id
         - processed_conversations: the exact conversations extraction ran on
-          (after the cost cap), so the caller records precisely those in the
-          idempotency ledger — no duplicated cap logic.
+          (after the cost cap and the noise pre-screen), so the caller
+          records precisely those in the idempotency ledger — no duplicated
+          cap logic.
     """
     conversations = normalized.get("conversations", [])
     if not conversations:
@@ -293,9 +331,23 @@ def extract(normalized: dict) -> tuple[list, list]:
         logger.warning("Capping extraction: %d -> %d conversations", total, max_conv)
         conversations = conversations[:max_conv]
 
+    # Issue #181 (P2-4): screen the input before paying for extraction, not
+    # just the output after. Conversations that are entirely ops telemetry
+    # ("disk usage was 47%", "cron job ran", ...) are dropped here so they
+    # never enter a paid DeepSeek batch. Still counted in
+    # processed_conversations so the idempotency ledger doesn't re-scan them
+    # on every future run.
+    to_extract = [c for c in conversations if not _is_all_noise_conversation(c)]
+    skipped_noise = len(conversations) - len(to_extract)
+    if skipped_noise:
+        print(f"  [extract] skipped {skipped_noise} all-noise conversation(s) "
+              f"before extraction (issue #181)", file=sys.stderr, flush=True)
+        logger.info("Noise pre-screen dropped %d/%d conversations before extraction",
+                    skipped_noise, len(conversations))
+
     all_facts = []
-    batches = [conversations[i:i + _BATCH_SIZE] for i in range(0, len(conversations), _BATCH_SIZE)]
-    print(f"  [extract] {len(conversations)} conversations -> ~{len(batches)} API "
+    batches = [to_extract[i:i + _BATCH_SIZE] for i in range(0, len(to_extract), _BATCH_SIZE)]
+    print(f"  [extract] {len(to_extract)} conversations -> ~{len(batches)} API "
           f"calls (batch size {_BATCH_SIZE})", file=sys.stderr, flush=True)
 
     for batch_idx, batch in enumerate(batches):
@@ -333,5 +385,8 @@ def extract(normalized: dict) -> tuple[list, list]:
                     str(c.get("id", "")) for c in batch if c.get("id"))
             all_facts.append(fact)
 
-    # `conversations` here is the (possibly capped) list we actually processed.
+    # `conversations` here is the (possibly capped) list we actually
+    # processed -- including any all-noise ones the pre-screen skipped
+    # calling the API for, since they were still handled this run and must
+    # not be re-scanned by the caller's idempotency ledger every time.
     return all_facts, conversations
