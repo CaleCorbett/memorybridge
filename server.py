@@ -955,6 +955,60 @@ def delete_memory(
 
 
 @mcp.tool()
+def bulk_delete(
+    ids: list[str],
+    profile: str = None
+) -> str:
+    """
+    Delete multiple memories by ID in a single operation.
+
+    Iterates over the supplied IDs, deleting each one. Returns per-id results
+    (deleted or not_found) and the total tokens freed across all successful
+    deletions. Destructive — local stdio only, never exposed over the HTTP
+    bridge (not in REMOTE_ALLOWED_TOOLS), per the security rule in CLAUDE.md.
+
+    Args:
+        ids: List of memory IDs to delete (e.g. ["mem_abc123", "mem_def456"])
+        profile: Memory profile
+    Returns:
+        JSON with status, per-id results, counts, and total tokens freed
+    """
+    profile = profile or _active_profile()
+    if not ids:
+        return json.dumps({"error": "ids list is empty"})
+    if _store.get_profile(profile) is None:
+        return json.dumps({"error": f"Profile '{profile}' not found"})
+
+    results = []
+    deleted_count = 0
+    not_found_count = 0
+    total_tokens_freed = 0
+
+    for mid in ids:
+        tokens_freed = _store.delete_memory(profile, mid)
+        if tokens_freed > 0:
+            deleted_count += 1
+            total_tokens_freed += tokens_freed
+            results.append({"id": mid, "status": "deleted", "tokens_freed": tokens_freed})
+        else:
+            not_found_count += 1
+            results.append({"id": mid, "status": "not_found", "tokens_freed": 0})
+
+    _store.log_access("bulk_delete", profile,
+                      f"requested={len(ids)}, deleted={deleted_count}, "
+                      f"not_found={not_found_count}, freed={total_tokens_freed} tokens")
+    return json.dumps({
+        "status": "completed",
+        "profile": profile,
+        "requested_count": len(ids),
+        "deleted_count": deleted_count,
+        "not_found_count": not_found_count,
+        "total_tokens_freed": total_tokens_freed,
+        "results": results
+    }, indent=2)
+
+
+@mcp.tool()
 def get_token_stats(profile: str = None) -> str:
     """
     Get comprehensive token usage statistics.

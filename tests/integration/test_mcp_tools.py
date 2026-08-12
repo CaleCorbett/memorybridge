@@ -111,6 +111,82 @@ def test_delete_nonexistent_returns_error(fresh_store):
 
 
 # -------------------------------------------------------------------------
+# bulk_delete
+# -------------------------------------------------------------------------
+
+def test_bulk_delete_multiple(fresh_store):
+    import server
+    # Add three memories
+    ids = []
+    for i in range(3):
+        r = json.loads(server.add_memory.fn(f"Bulk delete me {i}", category="fact", profile="default"))
+        ids.append(r["memory_id"])
+
+    result = json.loads(server.bulk_delete.fn(ids=ids, profile="default"))
+    assert result["status"] == "completed"
+    assert result["deleted_count"] == 3
+    assert result["not_found_count"] == 0
+    assert result["requested_count"] == 3
+    assert result["total_tokens_freed"] > 0
+    assert len(result["results"]) == 3
+    for r in result["results"]:
+        assert r["status"] == "deleted"
+        assert r["tokens_freed"] > 0
+
+    # Confirm they're gone from the store
+    mem_result = json.loads(server.get_memory.fn(profile="default"))
+    existing_ids = {m["id"] for m in mem_result["memories"]}
+    assert not (existing_ids & set(ids))
+
+
+def test_bulk_delete_mixed_found_not_found(fresh_store):
+    import server
+    r = json.loads(server.add_memory.fn("Keep me for bulk", category="fact", profile="default"))
+    real_id = r["memory_id"]
+
+    result = json.loads(server.bulk_delete.fn(
+        ids=[real_id, "mem_nonexistent1", "mem_nonexistent2"],
+        profile="default"
+    ))
+    assert result["status"] == "completed"
+    assert result["deleted_count"] == 1
+    assert result["not_found_count"] == 2
+    assert result["requested_count"] == 3
+    statuses = {r["id"]: r["status"] for r in result["results"]}
+    assert statuses[real_id] == "deleted"
+    assert statuses["mem_nonexistent1"] == "not_found"
+    assert statuses["mem_nonexistent2"] == "not_found"
+
+
+def test_bulk_delete_empty_list(fresh_store):
+    import server
+    result = json.loads(server.bulk_delete.fn(ids=[], profile="default"))
+    assert "error" in result
+    assert "empty" in result["error"]
+
+
+def test_bulk_delete_duplicate_id(fresh_store):
+    import server
+    r = json.loads(server.add_memory.fn("Delete me twice", category="fact", profile="default"))
+    mid = r["memory_id"]
+
+    result = json.loads(server.bulk_delete.fn(ids=[mid, mid], profile="default"))
+    assert result["status"] == "completed"
+    assert result["deleted_count"] == 1
+    assert result["not_found_count"] == 1
+    # First occurrence deleted, second not_found (already gone)
+    assert result["results"][0]["status"] == "deleted"
+    assert result["results"][1]["status"] == "not_found"
+
+
+def test_bulk_delete_not_in_remote_allowlist():
+    """bulk_delete is destructive and must never be exposed over the HTTP bridge."""
+    import server
+    assert "bulk_delete" not in server.REMOTE_ALLOWED_TOOLS
+    assert "delete_memory" not in server.REMOTE_ALLOWED_TOOLS
+
+
+# -------------------------------------------------------------------------
 # edit_memory
 # -------------------------------------------------------------------------
 
