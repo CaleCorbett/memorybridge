@@ -134,7 +134,7 @@ def test_extract_still_calls_api_for_real_conversation(monkeypatch):
                   "importance": "medium", "confidence": 0.9}]
 
     monkeypatch.setattr(extractor, "_call_deepseek", fake_call_deepseek)
-    monkeypatch.setattr(extractor, "_get_client", lambda: object())
+    monkeypatch.setattr(extractor, "_get_client", object)
 
     normalized = {
         "conversations": [
