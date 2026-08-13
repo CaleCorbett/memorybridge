@@ -157,3 +157,44 @@ def test_scan_inbox_known_format_counts_as_processed_in_dry_run(tmp_path):
     summary = scan_inbox(inbox, profile="default", _dry_run=True)
     assert summary["processed"] == 1
     assert (inbox / "processed" / "claude_export.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Lock file path (issue #181 P2-5: self-retrigger loop)
+# ---------------------------------------------------------------------------
+
+def test_lock_file_path_is_outside_inbox_directory(tmp_path, monkeypatch):
+    """The lock file must NOT live inside MEMORYBRIDGE_DATA/inbox — opening
+    it with mode "w" touches its mtime, which used to change the watched
+    inbox directory's mtime and re-trigger launchd (6415 self-retriggers
+    logged since 2026-05-10, per issue #181)."""
+    from watcher import _lock_file_path, DEFAULT_INBOX
+    monkeypatch.setenv("MEMORYBRIDGE_DATA", str(tmp_path))
+    # Reload DEFAULT_INBOX-dependent state isn't needed since both
+    # _lock_file_path and DEFAULT_INBOX read the env var live at call/import
+    # time; re-import watcher fresh so DEFAULT_INBOX picks up the new env.
+    import importlib
+    import watcher as watcher_mod
+    importlib.reload(watcher_mod)
+
+    lock_path = watcher_mod._lock_file_path()
+    inbox_path = watcher_mod.DEFAULT_INBOX
+
+    # The lock file's directory must not be the inbox directory, and the
+    # inbox directory must not be an ancestor of the lock file.
+    assert lock_path.parent != inbox_path
+    assert inbox_path not in lock_path.parents
+
+
+def test_lock_file_path_is_watcher_lock_named():
+    from watcher import _lock_file_path
+    assert _lock_file_path().name == ".watcher.lock"
+
+
+def test_lock_file_path_defaults_under_home_memorybridge(monkeypatch):
+    monkeypatch.delenv("MEMORYBRIDGE_DATA", raising=False)
+    import importlib
+    import watcher as watcher_mod
+    importlib.reload(watcher_mod)
+    lock_path = watcher_mod._lock_file_path()
+    assert str(lock_path).startswith(str(Path.home() / "memorybridge"))

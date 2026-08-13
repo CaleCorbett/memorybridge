@@ -158,6 +158,37 @@ def _mem_id() -> str:
     return f"mem_{uuid.uuid4().hex[:8]}"
 
 
+def _pack_vector(vec: list[float]) -> bytes:
+    """Pack a float vector into a compact float32 BLOB (issue #181 P2-1).
+
+    Replaces json.dumps(vec) storage: no repeated ASCII-float formatting on
+    write, no json.loads()/parsing (~81ms per semantic search across a
+    profile) on read, and roughly a quarter of the on-disk size of the
+    JSON-text equivalent.
+    """
+    import numpy as np
+    return np.asarray(vec, dtype=np.float32).tobytes()
+
+
+def _unpack_vector(blob) -> list[float] | None:
+    """Inverse of _pack_vector. Returns None (not raise) on unparseable input
+    so a corrupt/legacy row can't crash search_semantic — same fail-soft
+    contract the old json.loads()/except JSONDecodeError path had."""
+    if blob is None:
+        return None
+    import numpy as np
+    try:
+        if isinstance(blob, (bytes, bytearray, memoryview)):
+            return np.frombuffer(blob, dtype=np.float32).tolist()
+        # Backward-compat: a row that hasn't been migrated from JSON text yet
+        # (should not happen post-migration, but fail soft rather than crash).
+        if isinstance(blob, str):
+            return json.loads(blob)
+    except Exception:
+        return None
+    return None
+
+
 class MemoryStore:
     """
     SQLite-backed memory store with WAL mode, FTS5 search, and content-hash dedup.
@@ -995,7 +1026,7 @@ class MemoryStore:
                     self._conn.execute(
                         "INSERT OR REPLACE INTO memory_embeddings(id, profile, vector) "
                         "VALUES(?,?,?)",
-                        (memory_id, profile, json.dumps(vec))
+                        (memory_id, profile, _pack_vector(vec))
                     )
                     self._conn.commit()
             return True
@@ -1044,7 +1075,7 @@ class MemoryStore:
                 self._conn.executemany(
                     "INSERT OR REPLACE INTO memory_embeddings(id, profile, vector) "
                     "VALUES(?,?,?)",
-                    [(r["id"], r["profile"], json.dumps(v))
+                    [(r["id"], r["profile"], _pack_vector(v))
                      for r, v in zip(rows, vectors)]
                 )
                 self._conn.commit()
@@ -1133,6 +1164,85 @@ class MemoryStore:
         except Exception:
             pass
 
+        self._migrate_embeddings_v2()
+
+    def _migrate_embeddings_v2(self) -> None:
+        """One-time hygiene for issue #181 (P2-1), run on EVERY construction —
+        unlike the fresh-DB-only purge in __init__ (#4), this repairs DBs that
+        were already initialized before this fix existed, which is exactly the
+        case that let 440/1144 embedding rows sit orphaned forever (the old
+        purge only ran inside ``if not already_init``, a branch an existing DB
+        never takes again). Two independent problems, both idempotent:
+
+        1. Purge memory_embeddings rows whose parent memory no longer exists.
+           FK ON DELETE CASCADE only fires for deletes that happen *after*
+           ``PRAGMA foreign_keys=ON`` was set on the deleting connection; rows
+           orphaned before that (or by any out-of-band write) are permanent
+           without an explicit sweep like this one.
+        2. Convert any vector still stored as JSON text (pre-BLOB rows) to a
+           packed float32 BLOB, so every row benefits from the parse-free read
+           path in search_semantic regardless of which version wrote it.
+
+        Guarded by a meta flag per logical migration step so a large table
+        doesn't get re-scanned on every process start once it's clean.
+        """
+        try:
+            purged_flag = self._conn.execute(
+                "SELECT value FROM meta WHERE key='embeddings_orphan_purge_v1'"
+            ).fetchone()
+            if not purged_flag:
+                cur = self._conn.execute(
+                    "DELETE FROM memory_embeddings "
+                    "WHERE id NOT IN (SELECT id FROM memories)"
+                )
+                purged = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO meta VALUES('embeddings_orphan_purge_v1', ?)",
+                    (datetime.now().isoformat(),)
+                )
+                self._conn.commit()
+                if purged:
+                    import sys
+                    print(f"[memorybridge] purged {purged} orphaned embedding rows",
+                          file=sys.stderr)
+        except Exception as e:
+            logger.warning("Orphan embedding purge skipped: %s", e)
+
+        try:
+            blob_flag = self._conn.execute(
+                "SELECT value FROM meta WHERE key='embeddings_blob_migration_v1'"
+            ).fetchone()
+            if not blob_flag:
+                rows = self._conn.execute(
+                    "SELECT id, vector FROM memory_embeddings"
+                ).fetchall()
+                converted = 0
+                with self._conn.transaction():
+                    for row in rows:
+                        v = row["vector"]
+                        if isinstance(v, str):
+                            try:
+                                vec = json.loads(v)
+                            except (json.JSONDecodeError, TypeError):
+                                continue
+                            if isinstance(vec, list):
+                                self._conn.execute(
+                                    "UPDATE memory_embeddings SET vector=? WHERE id=?",
+                                    (_pack_vector(vec), row["id"])
+                                )
+                                converted += 1
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO meta VALUES('embeddings_blob_migration_v1', ?)",
+                        (datetime.now().isoformat(),)
+                    )
+                    self._conn.commit()
+                if converted:
+                    import sys
+                    print(f"[memorybridge] migrated {converted} embedding rows from JSON to BLOB",
+                          file=sys.stderr)
+        except Exception as e:
+            logger.warning("Embedding BLOB migration skipped: %s", e)
+
     def embeddings_available(self) -> bool:
         """True if the embedding model can actually embed text. Used as an
         ingestion pre-flight: if this is False, semantic dedup is unavailable
@@ -1174,7 +1284,7 @@ class MemoryStore:
 
         self._conn.executemany(
             "INSERT OR REPLACE INTO memory_embeddings(id, profile, vector) VALUES(?,?,?)",
-            [(mid, profile, json.dumps(vec)) for mid, vec in zip(ids, vectors)]
+            [(mid, profile, _pack_vector(vec)) for mid, vec in zip(ids, vectors)]
         )
         self._conn.commit()
         return len(ids)
@@ -1215,9 +1325,15 @@ class MemoryStore:
             return self.search(profile, query, limit=limit, max_tokens=max_tokens)
         q_len = len(q_vec)
 
-        # Fetch all embedding rows for profile
+        # Fetch embedding rows for profile, joined against memories to exclude
+        # archived ones (issue #181 P2-1): archived memories are unreachable
+        # via normal reads (archived=0 is hardcoded on every read path) but
+        # their embeddings were still being loaded and scored on every
+        # semantic search — pure wasted work once a memory is archived.
         rows = self._conn.execute(
-            "SELECT e.id, e.vector FROM memory_embeddings e WHERE e.profile=?",
+            "SELECT e.id, e.vector FROM memory_embeddings e "
+            "JOIN memories m ON m.id = e.id "
+            "WHERE e.profile=? AND m.archived=0",
             (profile,)
         ).fetchall()
 
@@ -1230,11 +1346,7 @@ class MemoryStore:
         mat: list[list[float]] = []
         mismatched = 0
         for row in rows:
-            try:
-                vec = json.loads(row["vector"])
-            except (json.JSONDecodeError, TypeError):
-                mismatched += 1
-                continue
+            vec = _unpack_vector(row["vector"])
             if not isinstance(vec, list) or len(vec) != q_len:
                 mismatched += 1
                 continue
