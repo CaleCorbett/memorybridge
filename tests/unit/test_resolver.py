@@ -14,8 +14,6 @@ import os
 import sys
 import types
 
-import pytest
-
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key-not-real")
 
 
