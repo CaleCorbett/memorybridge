@@ -10,8 +10,6 @@ Covers:
 """
 import os
 
-import pytest
-
 os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
 
 import ingestion.extractor as extractor  # noqa: E402
