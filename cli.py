@@ -132,6 +132,52 @@ def cmd_ui(args: argparse.Namespace) -> int:
     return subprocess.call(["streamlit", "run", app], env=dict(os.environ))
 
 
+def cmd_backup(args: argparse.Namespace) -> int:
+    """Create, list, or verify VACUUM INTO backups."""
+    from db.backup import create_backup, verify_backup, list_backups
+    data = config.data_dir()
+    db_path = data / "memory.db"
+    backup_dir = data / "backups"
+
+    if args.list:
+        results = list_backups(backup_dir)
+        if not results:
+            print("No backups found.")
+            return 0
+        print(f"{'Timestamp':<22} {'Size':>10}  {'Memories':>8}  {'Integrity'}")
+        print("-" * 60)
+        for r in results:
+            size = f"{r.size_bytes / 1024 / 1024:.1f} MB"
+            ok = "✓" if r.integrity_ok else "✗ FAILED"
+            print(f"{r.created_at:<22} {size:>10}  {r.memory_count:>8}  {ok}")
+        return 0
+
+    if args.verify:
+        results = list_backups(backup_dir)
+        if not results:
+            print("No backups found to verify.")
+            return 0
+        all_ok = True
+        for r in results:
+            status = "OK" if r.integrity_ok else "FAILED"
+            print(f"{r.path.name}: {status} ({r.memory_count} memories)")
+            if not r.integrity_ok:
+                all_ok = False
+        return 0 if all_ok else 1
+
+    # Default: create a new backup.
+    if not db_path.exists():
+        print(f"Database not found: {db_path}")
+        return 1
+    result = create_backup(db_path, backup_dir)
+    size_mb = result.size_bytes / 1024 / 1024
+    print(f"Backup created: {result.path.name}")
+    print(f"  Size: {size_mb:.1f} MB")
+    print(f"  Memories: {result.memory_count}")
+    print(f"  Integrity: {'OK' if result.integrity_ok else 'FAILED'}")
+    return 0
+
+
 def cmd_maintain(args: argparse.Namespace) -> int:
     from datetime import datetime
     data = config.data_dir()
@@ -144,6 +190,17 @@ def cmd_maintain(args: argparse.Namespace) -> int:
 
     mode = "weekly" if args.weekly else "nightly"
     print(f"Running MemoryBridge {mode} maintenance for profile '{profile}'...")
+
+    # 0. Pre-maintenance backup (before any destructive operation)
+    db_path = data / "memory.db"
+    if db_path.exists():
+        try:
+            from db.backup import create_backup
+            result = create_backup(db_path, data / "backups")
+            size_mb = result.size_bytes / 1024 / 1024
+            print(f"  Backup: {result.path.name} ({size_mb:.1f} MB, {result.memory_count} memories)")
+        except Exception as exc:
+            print(f"  Backup failed (non-fatal): {exc}")
 
     # 1. Purge expired TTL memories
     now_iso = datetime.now().isoformat()
@@ -196,6 +253,11 @@ def build_parser() -> argparse.ArgumentParser:
     ig.set_defaults(func=cmd_ingest)
 
     sub.add_parser("ui", help="launch the Streamlit review UI").set_defaults(func=cmd_ui)
+
+    bk = sub.add_parser("backup", help="create, list, or verify VACUUM INTO backups")
+    bk.add_argument("--list", action="store_true", help="list existing backups")
+    bk.add_argument("--verify", action="store_true", help="verify all existing backups")
+    bk.set_defaults(func=cmd_backup)
 
     mt = sub.add_parser("maintain", help="run background maintenance (TTL cleanup, dedup, pruning)")
     mt.add_argument("--nightly", action="store_true", help="run nightly maintenance (default)")
