@@ -9,7 +9,6 @@ Covers:
          fact still go through extraction untouched.
 """
 import os
-import sys
 
 import pytest
 
