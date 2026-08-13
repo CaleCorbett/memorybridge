@@ -105,7 +105,7 @@ def test_extract_skips_noise_only_conversation_without_api_call(monkeypatch):
         return []
 
     monkeypatch.setattr(extractor, "_call_deepseek", fake_call_deepseek)
-    monkeypatch.setattr(extractor, "_get_client", lambda: object())
+    monkeypatch.setattr(extractor, "_get_client", object)
 
     normalized = {
         "conversations": [
