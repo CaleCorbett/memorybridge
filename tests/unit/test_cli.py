@@ -55,3 +55,47 @@ def test_parser_requires_subcommand():
 def test_ingest_args_parse():
     args = cli.build_parser().parse_args(["ingest", "--source", "claude", "--file", "x.json"])
     assert args.source == "claude" and args.file == "x.json"
+
+
+def test_status_no_db(tmp_path, capsys):
+    rc = cli.main(["status"])
+    assert rc == 1
+    assert "Database not found" in capsys.readouterr().out
+
+
+def test_status_empty_profile(tmp_path, capsys):
+    assert cli.main(["init"]) == 0
+    capsys.readouterr()  # discard init output
+    rc = cli.main(["status", "--profile", "empty"])
+    assert rc == 0
+    assert "No active memories" in capsys.readouterr().out
+
+
+def test_status_groups_and_trust_labels(tmp_path, capsys):
+    assert cli.main(["init"]) == 0
+    from db.store import MemoryStore
+    store = MemoryStore(tmp_path / "memory.db")
+    store.add_memory("default", "stdio-written fact", source="claude",
+                     skip_enrichment=True)
+    store.add_memory("default", "bridge-written fact", source="remote",
+                     skip_enrichment=True)
+    store.add_memory("default", "hermes-claimed fact", source="remote",
+                     client_name="hermes", skip_enrichment=True)
+    store.add_memory("default", "pre-provenance fact", skip_enrichment=True)
+    capsys.readouterr()  # discard init output
+
+    rc = cli.main(["status"])
+    assert rc == 0
+    out = capsys.readouterr().out
+
+    # One line per (source, client_name) identity with its honest trust label.
+    assert "verified" in out          # source="claude"
+    assert "unattributed" in out      # source="remote", no client_name
+    assert "self-reported" in out     # client_name set — never shown as fact
+    assert "hermes" in out
+    assert "untracked" in out         # NULL source (pre-#180 rows)
+    # Totals line reflects all four memories and the budget.
+    assert "4 total" in out
+    assert "of token budget" in out
+    # Everything was written just now, so the 7-day delta shows on each row.
+    assert "▲1" in out

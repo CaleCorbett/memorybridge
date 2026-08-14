@@ -178,6 +178,92 @@ def cmd_backup(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_status(args: argparse.Namespace) -> int:
+    """Per-client activity summary: volume bar, count, 7-day delta, trust label.
+
+    Trust labels are honest about provenance (#180): `source` is
+    transport-verified ("claude" = stdio, provably Claude Code/Desktop;
+    "remote" = HTTP bridge, provably non-Claude but unknown which model),
+    while `client_name` is self-reported and unverified — any caller can
+    claim any name. Rows written before provenance existed have NULL source
+    and are labeled `untracked` rather than guessed at.
+    """
+    from datetime import datetime, timedelta
+    data = config.data_dir()
+    db_path = data / "memory.db"
+    if not db_path.exists():
+        print(f"Database not found: {db_path} (run `mb init` first)")
+        return 1
+    os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
+    from db.store import MemoryStore
+    store = MemoryStore(db_path)
+    profile = args.profile or "default"
+
+    week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+    rows = store._conn.execute(
+        """SELECT source, client_name,
+                  COUNT(*)                                        AS mem,
+                  SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS recent,
+                  MAX(created_at)                                 AS last_write
+           FROM memories
+           WHERE profile = ? AND archived = 0
+           GROUP BY source, client_name
+           ORDER BY mem DESC""",
+        (week_ago, profile),
+    ).fetchall()
+
+    if not rows:
+        print(f"No active memories in profile '{profile}'.")
+        return 0
+
+    def identity(r) -> tuple[str, str]:
+        """(display name, trust label) for a (source, client_name) group."""
+        if r["client_name"]:
+            return r["client_name"], "self-reported"
+        if r["source"] == "claude":
+            return "claude", "verified"
+        if r["source"] == "remote":
+            return "remote", "unattributed"
+        return "unknown", "untracked"
+
+    BAR_WIDTH = 22
+    max_mem = max(r["mem"] for r in rows)
+    clients = []
+    for r in rows:
+        name, trust = identity(r)
+        filled = max(1, round(r["mem"] / max_mem * BAR_WIDTH)) if r["mem"] else 0
+        bar = "●" * filled + "○" * (BAR_WIDTH - filled)
+        delta = f"▲{r['recent']}" if r["recent"] else "—"
+        clients.append((name, bar, r["mem"], delta, trust, r["last_write"]))
+
+    name_w = max(8, max(len(c[0]) for c in clients) + 2)
+    print(f"{'MODEL':<{name_w}} {'ACTIVITY':<{BAR_WIDTH + 2}} {'MEM':>5}  {'Δ7D':<5} TRUST")
+    for name, bar, mem, delta, trust, _ in clients:
+        print(f"{name:<{name_w}} {bar:<{BAR_WIDTH + 2}} {mem:>5}  {delta:<5} {trust}")
+
+    # Totals line: count, % of token budget, most recent write across clients.
+    stats = store.token_stats(profile)
+    budget = config.max_total_tokens()
+    pct = f"{stats['total_tokens'] / budget * 100:.1f}%" if budget else "n/a"
+    last_name, last_ts = max(
+        ((c[0], c[5]) for c in clients if c[5]), key=lambda t: t[1], default=(None, None)
+    )
+    if last_ts:
+        try:
+            age = datetime.now() - datetime.fromisoformat(last_ts)
+            secs = int(age.total_seconds())
+            human = (f"{secs // 86400}d" if secs >= 86400 else
+                     f"{secs // 3600}h" if secs >= 3600 else
+                     f"{max(secs // 60, 1)}m") + " ago"
+        except ValueError:
+            human = last_ts
+        last_part = f" · last write {human} ({last_name})"
+    else:
+        last_part = ""
+    print(f"\n{stats['memory_count']} total · {pct} of token budget{last_part}")
+    return 0
+
+
 def cmd_maintain(args: argparse.Namespace) -> int:
     from datetime import datetime
     data = config.data_dir()
@@ -253,6 +339,10 @@ def build_parser() -> argparse.ArgumentParser:
     ig.set_defaults(func=cmd_ingest)
 
     sub.add_parser("ui", help="launch the Streamlit review UI").set_defaults(func=cmd_ui)
+
+    stp = sub.add_parser("status", help="per-client activity: volume, 7-day delta, trust")
+    stp.add_argument("--profile", default="default", help="target profile")
+    stp.set_defaults(func=cmd_status)
 
     bk = sub.add_parser("backup", help="create, list, or verify VACUUM INTO backups")
     bk.add_argument("--list", action="store_true", help="list existing backups")
