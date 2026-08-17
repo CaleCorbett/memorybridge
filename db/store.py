@@ -1002,7 +1002,15 @@ class MemoryStore:
             with self._embed_lock:
                 if self._embed_model is None:
                     from fastembed import TextEmbedding
-                    self._embed_model = TextEmbedding("BAAI/bge-small-en-v1.5")
+                    # Pin the model cache to a persistent location. FastEmbed's
+                    # default is tempfile.gettempdir()/fastembed_cache, which on
+                    # macOS is /var/folders/.../T/ — purged after ~3 days of
+                    # inactivity. A search landing mid-re-download then fails
+                    # with a transient "utf-8 codec can't decode" error.
+                    self._embed_model = TextEmbedding(
+                        "BAAI/bge-small-en-v1.5",
+                        cache_dir=str(Path.home() / ".cache" / "fastembed"),
+                    )
         return self._embed_model
 
     def _embed_texts(self, texts: list[str]) -> list[list[float]]:
