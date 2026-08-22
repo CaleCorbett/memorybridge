@@ -266,6 +266,18 @@ def scan_inbox(inbox: Path, profile: str = "default", preview: bool = False,
     return {"processed": processed, "failed": failed, "skipped": skipped}
 
 
+def _lock_file_path() -> Path:
+    """Where the single-instance lock file lives.
+
+    Issue #181 (P2-5): must NOT be inside the inbox directory launchd
+    watches — see main() for the full self-retrigger explanation. Lives in
+    MEMORYBRIDGE_DATA (or ~/memorybridge) instead, a sibling of inbox/, not
+    a path launchd has a WatchPaths entry for.
+    """
+    data_dir = Path(os.environ.get("MEMORYBRIDGE_DATA", Path.home() / "memorybridge")).expanduser()
+    return data_dir / ".watcher.lock"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MemoryBridge inbox watcher (single-shot, for launchd)"
@@ -295,7 +307,16 @@ def main():
     # cost + duplicate writes, then a FileNotFoundError when the loser's rename
     # finds the file gone). Hold an exclusive lock for the run; if another
     # instance holds it, exit cleanly.
-    lock_file = open(inbox / ".watcher.lock", "w")
+    #
+    # Issue #181 (P2-5): this lock file used to live INSIDE the inbox
+    # directory launchd is watching. Opening it with mode "w" touches that
+    # file's mtime, which changes the watched directory's mtime, which
+    # re-triggers launchd — a self-retrigger loop that fired 6415 times since
+    # 2026-05-10, nearly all no-ops (a watcher run that finds nothing new).
+    # Moving the lock to the data dir (never watched) breaks the loop.
+    lock_path = _lock_file_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "w")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (OSError, BlockingIOError):

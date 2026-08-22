@@ -45,19 +45,12 @@ jobs:
 
       # Gating suite: the stable, self-contained unit tests.
       # Excluded here (tracked in separate issues, run non-blocking below):
-      #   - tests/unit/test_performance.py, tests/unit/test_passport.py:
-      #       import `server` and call the FastMCP tool `.fn` attribute, so they
-      #       are coupled to the exact fastmcp version — re-enable once fastmcp
-      #       is pinned.
       #   - tests/ui: currently broken (patches a symbol the module no longer
       #       exposes).
       #   - tests/integration: needs a live server/runtime.
       - name: Run unit tests (gating)
         run: |
-          python -m pytest tests/unit \
-            --ignore=tests/unit/test_performance.py \
-            --ignore=tests/unit/test_passport.py \
-            -q
+          python -m pytest tests/unit -q
 
   full-suite:
     name: full suite (informational, non-blocking)

@@ -1,0 +1,8 @@
+[Unit]
+Description=MemoryBridge Nightly Maintenance Job
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=mb maintain --nightly --profile default
+Environment=MEMORYBRIDGE_DATA=%h/memorybridge

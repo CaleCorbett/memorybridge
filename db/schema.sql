@@ -32,7 +32,27 @@ CREATE TABLE IF NOT EXISTS memories (
     -- newer fact replaces this one; superseded_by points at that newer memory.
     -- A NULL valid_until means the fact is still current.
     valid_until    TEXT,
-    superseded_by  TEXT
+    superseded_by  TEXT,
+    -- Write provenance (#180). "claude" = written over local stdio
+    -- (Claude Code/Desktop) — provably true, since that's the only
+    -- transport a stdio process serves. "remote" = written over the HTTP
+    -- bridge — provably non-Claude-Code, but NOT which specific model, since
+    -- the capability-URL auth scheme is one shared secret for every remote
+    -- client (see server.py's _caller_model). NULL for rows written before
+    -- this column existed.
+    source         TEXT,
+    -- Self-reported client label (e.g. "hermes"), distinct from `source`.
+    -- `source` is transport-derived and can't be spoofed by the caller
+    -- (a stdio process really is local, an HTTP-bridge request really is
+    -- remote); `client_name` is whatever the caller says it is, unverified —
+    -- useful when you already trust your own multi-agent setup (Hermes,
+    -- a future second local agent) but not a substitute for real per-client
+    -- auth. Sanitized (lowercase, [a-z0-9_-], <=32 chars) on write.
+    client_name    TEXT,
+    -- 2026 Memory Engineering additions (v5.0)
+    confidence     REAL NOT NULL DEFAULT 1.0,
+    expires_at     TEXT,
+    status         TEXT NOT NULL DEFAULT 'active'
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_content_hash
@@ -41,6 +61,16 @@ CREATE INDEX IF NOT EXISTS idx_profile_cat
     ON memories(profile, category) WHERE archived = 0;
 CREATE INDEX IF NOT EXISTS idx_profile_score
     ON memories(profile, relevance_score DESC) WHERE archived = 0;
+
+CREATE TABLE IF NOT EXISTS memory_edges (
+    id           TEXT PRIMARY KEY,
+    source_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    target_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    relation     TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_edge_source ON memory_edges(source_id);
+CREATE INDEX IF NOT EXISTS idx_edge_target ON memory_edges(target_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     content,
@@ -82,13 +112,17 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-INSERT OR IGNORE INTO meta VALUES ('schema_version', '4.0');
+INSERT OR IGNORE INTO meta VALUES ('schema_version', '5.0');
+UPDATE meta SET value = '5.0' WHERE key = 'schema_version';
 
--- Phase 4: embedding vectors stored as JSON float arrays (no native extension needed)
+-- Phase 4: embedding vectors stored as packed float32 BLOBs (issue #181 P2-1).
+-- Previously JSON text, which cost ~81ms of json.loads() parsing per semantic
+-- search across the full profile and inflated DB size (9MB of 12.5MB was
+-- vector JSON). np.frombuffer() on a BLOB is a zero-copy view -- no parsing.
 CREATE TABLE IF NOT EXISTS memory_embeddings (
     id      TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
     profile TEXT NOT NULL,
-    vector  TEXT NOT NULL   -- JSON array of 384 floats (BAAI/bge-small-en-v1.5)
+    vector  BLOB NOT NULL   -- packed float32[384] (BAAI/bge-small-en-v1.5), see db/store.py _pack_vector
 );
 CREATE INDEX IF NOT EXISTS idx_embed_profile ON memory_embeddings(profile);
 

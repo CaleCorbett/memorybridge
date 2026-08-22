@@ -132,6 +132,194 @@ def cmd_ui(args: argparse.Namespace) -> int:
     return subprocess.call(["streamlit", "run", app], env=dict(os.environ))
 
 
+def cmd_backup(args: argparse.Namespace) -> int:
+    """Create, list, or verify VACUUM INTO backups."""
+    from db.backup import create_backup, verify_backup, list_backups
+    data = config.data_dir()
+    db_path = data / "memory.db"
+    backup_dir = data / "backups"
+
+    if args.list:
+        results = list_backups(backup_dir)
+        if not results:
+            print("No backups found.")
+            return 0
+        print(f"{'Timestamp':<22} {'Size':>10}  {'Memories':>8}  {'Integrity'}")
+        print("-" * 60)
+        for r in results:
+            size = f"{r.size_bytes / 1024 / 1024:.1f} MB"
+            ok = "✓" if r.integrity_ok else "✗ FAILED"
+            print(f"{r.created_at:<22} {size:>10}  {r.memory_count:>8}  {ok}")
+        return 0
+
+    if args.verify:
+        results = list_backups(backup_dir)
+        if not results:
+            print("No backups found to verify.")
+            return 0
+        all_ok = True
+        for r in results:
+            status = "OK" if r.integrity_ok else "FAILED"
+            print(f"{r.path.name}: {status} ({r.memory_count} memories)")
+            if not r.integrity_ok:
+                all_ok = False
+        return 0 if all_ok else 1
+
+    # Default: create a new backup.
+    if not db_path.exists():
+        print(f"Database not found: {db_path}")
+        return 1
+    result = create_backup(db_path, backup_dir)
+    size_mb = result.size_bytes / 1024 / 1024
+    print(f"Backup created: {result.path.name}")
+    print(f"  Size: {size_mb:.1f} MB")
+    print(f"  Memories: {result.memory_count}")
+    print(f"  Integrity: {'OK' if result.integrity_ok else 'FAILED'}")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Per-client activity summary: volume bar, count, 7-day delta, trust label.
+
+    Trust labels are honest about provenance (#180): `source` is
+    transport-verified ("claude" = stdio, provably Claude Code/Desktop;
+    "remote" = HTTP bridge, provably non-Claude but unknown which model),
+    while `client_name` is self-reported and unverified — any caller can
+    claim any name. Rows written before provenance existed have NULL source
+    and are labeled `untracked` rather than guessed at.
+    """
+    from datetime import datetime, timedelta
+    data = config.data_dir()
+    db_path = data / "memory.db"
+    if not db_path.exists():
+        print(f"Database not found: {db_path} (run `mb init` first)")
+        return 1
+    os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
+    from db.store import MemoryStore
+    store = MemoryStore(db_path)
+    profile = args.profile or "default"
+
+    week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+    rows = store._conn.execute(
+        """SELECT source, client_name,
+                  COUNT(*)                                        AS mem,
+                  SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS recent,
+                  MAX(created_at)                                 AS last_write
+           FROM memories
+           WHERE profile = ? AND archived = 0
+           GROUP BY source, client_name
+           ORDER BY mem DESC""",
+        (week_ago, profile),
+    ).fetchall()
+
+    if not rows:
+        print(f"No active memories in profile '{profile}'.")
+        return 0
+
+    def identity(r) -> tuple[str, str]:
+        """(display name, trust label) for a (source, client_name) group."""
+        if r["client_name"]:
+            return r["client_name"], "self-reported"
+        if r["source"] == "claude":
+            return "claude", "verified"
+        if r["source"] == "remote":
+            return "remote", "unattributed"
+        return "unknown", "untracked"
+
+    BAR_WIDTH = 22
+    max_mem = max(r["mem"] for r in rows)
+    clients = []
+    for r in rows:
+        name, trust = identity(r)
+        filled = max(1, round(r["mem"] / max_mem * BAR_WIDTH)) if r["mem"] else 0
+        bar = "●" * filled + "○" * (BAR_WIDTH - filled)
+        delta = f"▲{r['recent']}" if r["recent"] else "—"
+        clients.append((name, bar, r["mem"], delta, trust, r["last_write"]))
+
+    name_w = max(8, max(len(c[0]) for c in clients) + 2)
+    print(f"{'MODEL':<{name_w}} {'ACTIVITY':<{BAR_WIDTH + 2}} {'MEM':>5}  {'Δ7D':<5} TRUST")
+    for name, bar, mem, delta, trust, _ in clients:
+        print(f"{name:<{name_w}} {bar:<{BAR_WIDTH + 2}} {mem:>5}  {delta:<5} {trust}")
+
+    # Totals line: count, % of token budget, most recent write across clients.
+    stats = store.token_stats(profile)
+    budget = config.max_total_tokens()
+    pct = f"{stats['total_tokens'] / budget * 100:.1f}%" if budget else "n/a"
+    last_name, last_ts = max(
+        ((c[0], c[5]) for c in clients if c[5]), key=lambda t: t[1], default=(None, None)
+    )
+    if last_ts:
+        try:
+            age = datetime.now() - datetime.fromisoformat(last_ts)
+            secs = int(age.total_seconds())
+            human = (f"{secs // 86400}d" if secs >= 86400 else
+                     f"{secs // 3600}h" if secs >= 3600 else
+                     f"{max(secs // 60, 1)}m") + " ago"
+        except ValueError:
+            human = last_ts
+        last_part = f" · last write {human} ({last_name})"
+    else:
+        last_part = ""
+    print(f"\n{stats['memory_count']} total · {pct} of token budget{last_part}")
+    return 0
+
+
+def cmd_maintain(args: argparse.Namespace) -> int:
+    from datetime import datetime
+    data = config.data_dir()
+    os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
+    from db.store import MemoryStore
+    from db.pruner import run_auto_prune
+    store = MemoryStore(data / "memory.db")
+    profile = args.profile or "default"
+    store.ensure_profile(profile)
+
+    mode = "weekly" if args.weekly else "nightly"
+    print(f"Running MemoryBridge {mode} maintenance for profile '{profile}'...")
+
+    # 0. Pre-maintenance backup (before any destructive operation)
+    db_path = data / "memory.db"
+    if db_path.exists():
+        try:
+            from db.backup import create_backup
+            result = create_backup(db_path, data / "backups")
+            size_mb = result.size_bytes / 1024 / 1024
+            print(f"  Backup: {result.path.name} ({size_mb:.1f} MB, {result.memory_count} memories)")
+        except Exception as exc:
+            print(f"  Backup failed (non-fatal): {exc}")
+
+    # 1. Purge expired TTL memories
+    now_iso = datetime.now().isoformat()
+    with store._conn.transaction():
+        cur = store._conn.execute(
+            "UPDATE memories SET archived=1, archived_at=?, archive_reason='TTL expired' "
+            "WHERE profile=? AND archived=0 AND expires_at IS NOT NULL AND expires_at < ?",
+            (now_iso, profile, now_iso)
+        )
+        expired_count = cur.rowcount
+        store._conn.commit()
+    print(f"  Expired TTL memories purged: {expired_count}")
+
+    # 2. Dedup / Auto-prune
+    prune_res = run_auto_prune(store._conn, profile, store.delete_memory, allow_auto_delete=True)
+    print(f"  Duplicates / stale auto-pruned: {len(prune_res.get('auto_executed', []))}")
+
+    if args.weekly:
+        # 3. Low-score pruning
+        budget_pruned = store.auto_prune(profile, threshold=0.15)
+        print(f"  Low-score memories archived: {len(budget_pruned)}")
+
+        stats = store.token_stats(profile)
+        edges = store._conn.execute("SELECT COUNT(*) FROM memory_edges").fetchone()[0]
+        print(f"\nWeekly Health Check:")
+        print(f"  Active memories: {stats.get('memory_count', 0)}")
+        print(f"  Total tokens: {stats.get('total_tokens', 0)}")
+        print(f"  Knowledge graph edges: {edges}")
+
+    print("Maintenance complete.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mb", description="MemoryBridge — cross-model memory server")
     sub = p.add_subparsers(dest="command", required=True)
@@ -151,6 +339,22 @@ def build_parser() -> argparse.ArgumentParser:
     ig.set_defaults(func=cmd_ingest)
 
     sub.add_parser("ui", help="launch the Streamlit review UI").set_defaults(func=cmd_ui)
+
+    stp = sub.add_parser("status", help="per-client activity: volume, 7-day delta, trust")
+    stp.add_argument("--profile", default="default", help="target profile")
+    stp.set_defaults(func=cmd_status)
+
+    bk = sub.add_parser("backup", help="create, list, or verify VACUUM INTO backups")
+    bk.add_argument("--list", action="store_true", help="list existing backups")
+    bk.add_argument("--verify", action="store_true", help="verify all existing backups")
+    bk.set_defaults(func=cmd_backup)
+
+    mt = sub.add_parser("maintain", help="run background maintenance (TTL cleanup, dedup, pruning)")
+    mt.add_argument("--nightly", action="store_true", help="run nightly maintenance (default)")
+    mt.add_argument("--weekly", action="store_true", help="run weekly maintenance & health report")
+    mt.add_argument("--profile", default="default", help="target profile")
+    mt.set_defaults(func=cmd_maintain)
+
     return p
 
 

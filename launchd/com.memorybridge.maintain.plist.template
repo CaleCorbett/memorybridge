@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memorybridge.maintain</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PYTHON}}</string>
+        <string>-m</string>
+        <string>cli</string>
+        <string>maintain</string>
+        <string>--nightly</string>
+        <string>--profile</string>
+        <string>default</string>
+    </array>
+
+    <!-- Run every night at 02:00 AM -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>2</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MEMORYBRIDGE_DATA</key>
+        <string>{{DATA_DIR}}</string>
+        <key>PATH</key>
+        <string>{{PYTHON_DIR}}:/usr/bin:/bin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>{{DATA_DIR}}/logs/maintain.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{DATA_DIR}}/logs/maintain_err.log</string>
+</dict>
+</plist>

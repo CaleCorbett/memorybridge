@@ -31,6 +31,20 @@ def test_remote_allowlist_includes_read_and_add():
         assert tool in allow
 
 
+def test_remote_allowlist_includes_export_for_model_and_list_profiles():
+    # Regression (issue #180): export_for_model exists specifically for
+    # non-Claude remote clients to consume, but was unreachable from the
+    # bridge those clients connect through. list_profiles is new — a
+    # read-only enumeration so a remote client (pinned to the default
+    # profile, but able to pass an explicit profile= to get_memory/etc.) can
+    # discover what profile names exist instead of guessing blind.
+    allow = server.REMOTE_ALLOWED_TOOLS
+    assert "export_for_model" in allow
+    assert "list_profiles" in allow
+    # switch_profile mutates global _current_profile state — must stay local.
+    assert "switch_profile" not in allow
+
+
 # --------------------------------------------------------------------------
 # Remote-mode profile resolution (#70)
 # --------------------------------------------------------------------------
@@ -45,6 +59,141 @@ def test_active_profile_pins_default_in_remote_mode():
         assert server._active_profile() == server.DEFAULT_PROFILE  # remote: pinned
     finally:
         server._REMOTE_MODE, server._current_profile = orig_remote, orig_cur
+
+
+# --------------------------------------------------------------------------
+# Caller-model attribution + list_profiles (#180)
+# --------------------------------------------------------------------------
+
+def test_caller_model_reflects_remote_mode():
+    # Regression (issue #180): every analytics event and, now, every
+    # add_memory write hardcoded model="claude" regardless of transport — the
+    # analytics table had no record a non-Claude client had ever touched the
+    # system even when one demonstrably had (proven live against the running
+    # bridge during the audit). _caller_model() is the honest ceiling given
+    # the current shared-secret auth: "claude" only when it's provably true
+    # (stdio), "remote" otherwise (HTTP bridge — non-Claude-Code, but not
+    # which specific model).
+    orig_remote = server._REMOTE_MODE
+    try:
+        server._REMOTE_MODE = False
+        assert server._caller_model() == "claude"
+        server._REMOTE_MODE = True
+        assert server._caller_model() == "remote"
+    finally:
+        server._REMOTE_MODE = orig_remote
+
+
+def test_list_profiles_is_read_only_and_does_not_switch(tmp_path, monkeypatch):
+    from db.store import MemoryStore
+    s = MemoryStore(tmp_path / "list_profiles_test.db")
+    monkeypatch.setattr(server, "_store", s)
+    s.ensure_profile("default")
+    s.ensure_profile("consulting")
+    orig_cur = server._current_profile
+    try:
+        server._current_profile = "default"
+        import json
+        result = json.loads(server.list_profiles.fn())
+        assert set(result["profiles"]) >= {"default", "consulting"}
+        assert result["default_profile"] == server.DEFAULT_PROFILE
+        # Must not have switched anything — that's switch_profile's job, and
+        # switch_profile stays local-only precisely because it mutates this.
+        assert server._current_profile == "default"
+    finally:
+        server._current_profile = orig_cur
+
+
+# --------------------------------------------------------------------------
+# Self-reported client_name (follow-on to #180)
+# --------------------------------------------------------------------------
+
+def test_sanitize_client_name():
+    assert server._sanitize_client_name("hermes") == "hermes"
+    assert server._sanitize_client_name("Hermes") == "hermes"
+    assert server._sanitize_client_name("  hermes  ") == "hermes"
+    assert server._sanitize_client_name("Hermes Agent!!") == "hermesagent"
+    assert server._sanitize_client_name("a" * 40) == "a" * 32
+    assert server._sanitize_client_name("") is None
+    assert server._sanitize_client_name("   ") is None
+    assert server._sanitize_client_name(None) is None
+    assert server._sanitize_client_name("!!!") is None  # sanitizes to empty
+
+
+def test_resolve_client_name_explicit_beats_env(monkeypatch):
+    monkeypatch.setenv("MEMORYBRIDGE_CLIENT_NAME", "env-default")
+    assert server._resolve_client_name("hermes") == "hermes"
+
+
+def test_resolve_client_name_falls_back_to_env(monkeypatch):
+    # The durable path (issue: HERMES.md-style prompt instructions aren't
+    # enforced — an LLM caller can forget to pass client_name, or a rules
+    # file can fail to load). A process-level env var set once on the
+    # spawned server.py instance (e.g. `hermes mcp add memorybridge --env
+    # MEMORYBRIDGE_CLIENT_NAME=hermes`) labels every write unconditionally.
+    monkeypatch.setenv("MEMORYBRIDGE_CLIENT_NAME", "hermes")
+    assert server._resolve_client_name(None) == "hermes"
+    assert server._resolve_client_name("") == "hermes"
+
+
+def test_resolve_client_name_sanitizes_env_value_too(monkeypatch):
+    monkeypatch.setenv("MEMORYBRIDGE_CLIENT_NAME", "Hermes Agent!!")
+    assert server._resolve_client_name(None) == "hermesagent"
+
+
+def test_resolve_client_name_none_when_neither_set(monkeypatch):
+    monkeypatch.delenv("MEMORYBRIDGE_CLIENT_NAME", raising=False)
+    assert server._resolve_client_name(None) is None
+
+
+def test_add_memory_tool_uses_env_fallback_without_explicit_arg(tmp_path, monkeypatch):
+    from db.store import MemoryStore
+    s = MemoryStore(tmp_path / "client_name_env_test.db")
+    monkeypatch.setattr(server, "_store", s)
+    s.ensure_profile("default")
+    monkeypatch.setattr(server, "_REMOTE_MODE", False)
+    monkeypatch.setenv("MEMORYBRIDGE_CLIENT_NAME", "hermes")
+
+    import json
+    out = json.loads(server.add_memory.fn(
+        content="written with no explicit client_name argument",
+        profile="default",
+    ))
+    mid = out["memory_id"]
+    row = s._conn.execute("SELECT client_name FROM memories WHERE id=?", (mid,)).fetchone()
+    assert row["client_name"] == "hermes"
+
+
+def test_add_memory_tool_persists_sanitized_client_name(tmp_path, monkeypatch):
+    from db.store import MemoryStore
+    s = MemoryStore(tmp_path / "client_name_test.db")
+    monkeypatch.setattr(server, "_store", s)
+    s.ensure_profile("default")
+    monkeypatch.setattr(server, "_REMOTE_MODE", False)
+
+    import json
+    out = json.loads(server.add_memory.fn(
+        content="written by a second local agent",
+        profile="default", client_name="Hermes Agent",
+    ))
+    mid = out["memory_id"]
+    row = s._conn.execute("SELECT source, client_name FROM memories WHERE id=?", (mid,)).fetchone()
+    assert row["source"] == "claude"          # transport-derived, unaffected
+    assert row["client_name"] == "hermesagent"  # self-reported, sanitized
+
+
+def test_get_memory_serves_client_name_field(tmp_path, monkeypatch):
+    from db.store import MemoryStore
+    s = MemoryStore(tmp_path / "client_name_served_test.db")
+    monkeypatch.setattr(server, "_store", s)
+    s.ensure_profile("default")
+    s.add_memory("default", "written by hermes", category="fact",
+                source="claude", client_name="hermes")
+
+    import json
+    out = json.loads(server.get_memory.fn(profile="default"))
+    mems = out["memories"]
+    assert any(m.get("client_name") == "hermes" for m in mems)
 
 
 # --------------------------------------------------------------------------
@@ -98,3 +247,14 @@ def test_middleware_uses_constant_time_compare():
     # not ==, to avoid a timing oracle. Verify the primitive is wired in.
     assert secrets.compare_digest("a" * 40, "a" * 40) is True
     assert _status(_make_mw(TOKEN), f"/{'T' * 39}X/mcp", "7.7.7.7") == 404
+
+
+def test_middleware_non_ascii_path_returns_404_not_500():
+    # Regression (issue #177): secrets.compare_digest raises TypeError on a
+    # non-ASCII str, and that ran before auth — so any unauthenticated request
+    # with a percent-encoded non-ASCII path segment (uvicorn decodes the raw
+    # path as UTF-8 before the scope reaches this middleware) crashed the ASGI
+    # app with an unhandled 500 instead of the uniform 404 every other
+    # bad-token path gets. Live-reproduced against the running bridge:
+    # GET /%C3%A9/mcp -> 500. Must behave exactly like any other wrong token.
+    assert _status(_make_mw(TOKEN), "/é/mcp", "8.8.8.8") == 404

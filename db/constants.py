@@ -40,10 +40,20 @@ def effective_score(row: dict, now: datetime) -> float:
 
 VALID_CATEGORIES = [
     "preference", "fact", "insight", "decision",
-    "project_status", "relationship", "skill", "constraint"
+    "project_status", "relationship", "skill", "constraint",
+    "procedural", "episodic"
 ]
 
 IMPORTANCE_LEVELS = ["low", "medium", "high", "critical"]
+
+_SECRET_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\b(sk-[a-zA-Z0-9_-]{20,})\b"), "OpenAI / Anthropic / API key"),
+    (re.compile(r"\b(ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{30,})\b"), "GitHub Personal Access Token"),
+    (re.compile(r"\b(AKIA[0-9A-Z]{16})\b"), "AWS Access Key ID"),
+    (re.compile(r"\b(xox[baprs]-[a-zA-Z0-9]{10,})\b"), "Slack Token"),
+    (re.compile(r"-----BEGIN (?:RSA|EC|OPENSSH|PRIVATE) KEY-----"), "Private Key"),
+    (re.compile(r"\b(?:postgres|postgresql|mysql|mongodb(?:\+srv)?)://[^:]+:[^@]+@"), "Database connection string with credentials"),
+]
 
 
 # --- Write-path guardrails -------------------------------------------------
@@ -58,13 +68,18 @@ MAX_MEMORY_H2_SECTIONS = 2     # >=2 "## " headers means it's a document
 def guardrail_check(content: str) -> tuple[bool, str]:
     """Deterministic gate for the memory write path.
 
-    Returns (ok, reason). ok=False means the content is document-shaped and
-    should be stored as a file (or compressed into a fact), NOT inserted as a
-    memory. Pure / zero-dependency so it is trivially unit-testable.
+    Returns (ok, reason). ok=False means the content is document-shaped or
+    contains sensitive credentials/secrets, NOT inserted as a memory.
+    Pure / zero-dependency so it is trivially unit-testable.
     """
     text = (content or "").strip()
     if not text:
         return False, "empty content"
+
+    # Security check: redact/block secret credentials
+    for pattern, desc in _SECRET_PATTERNS:
+        if pattern.search(text):
+            return False, f"security check failed: contains sensitive credential ({desc})"
 
     tc = _count_tokens(text)
     if tc > MAX_MEMORY_TOKENS:

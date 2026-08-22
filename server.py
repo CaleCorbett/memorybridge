@@ -26,6 +26,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 from fastmcp import FastMCP
+import workspace
 from db.pruner import run_auto_prune, record_outcome, get_pruner_report
 from db.constants import VALID_CATEGORIES, IMPORTANCE_LEVELS, _content_hash, _count_tokens, effective_score  # noqa: F401
 # Token counting, recency decay, and the model-export logic live in a
@@ -35,6 +36,7 @@ from exports import (  # noqa: E402
     count_tokens, apply_decay, DECAY_CONFIG,
     export_for_model as _export_for_model_impl,
     export_passport as _export_passport_impl,
+    UNTRUSTED_NOTICE,
 )
 
 # Initialize MCP server
@@ -76,6 +78,59 @@ def _active_profile() -> str:
     explicitly. Local stdio (single session) keeps the switchable global.
     """
     return DEFAULT_PROFILE if _REMOTE_MODE else _current_profile
+
+
+def _caller_model() -> str:
+    """Best-effort caller identity for analytics/provenance (#180).
+
+    The capability-URL auth scheme (see _RateLimitAuthMiddleware) is one
+    shared secret for every remote client — there is no per-client credential
+    to distinguish ChatGPT from Gemini from Perplexity. _REMOTE_MODE is the
+    only real signal available today, so this can only say "claude" (stdio —
+    provably true) or "remote" (HTTP bridge — true that it's non-Claude-Code,
+    unknown which one). Previously every analytics event hardcoded "claude"
+    regardless of transport, so the analytics table had no record that a
+    non-Claude client had ever touched the system even when one demonstrably
+    had. True per-model attribution needs F2 (per-client bearer tokens,
+    docs/MULTI_MODEL_FEATURES.md) — this is the honest ceiling until then.
+    """
+    return "remote" if _REMOTE_MODE else "claude"
+
+
+def _sanitize_client_name(client_name: Optional[str]) -> Optional[str]:
+    """Clean a caller-supplied client_name (e.g. "hermes") before storage.
+
+    Unlike _caller_model()'s source, this is self-reported and unverified —
+    any caller can claim any name. Sanitizing keeps it a short identifying
+    label rather than arbitrary text: lowercased, [a-z0-9_-] only, <=32 chars.
+    Empty/whitespace-only/None all collapse to None (no label).
+    """
+    if not client_name:
+        return None
+    cleaned = re.sub(r"[^a-z0-9_-]", "", client_name.strip().lower())[:32]
+    return cleaned or None
+
+
+def _resolve_client_name(client_name: Optional[str]) -> Optional[str]:
+    """Resolve the client_name to persist for an add_memory/add_memories call.
+
+    An explicit per-call argument always wins. Otherwise falls back to
+    MEMORYBRIDGE_CLIENT_NAME, a process-level default set on this specific
+    spawned server.py instance's environment (e.g. via `hermes mcp add
+    memorybridge --env MEMORYBRIDGE_CLIENT_NAME=hermes`).
+
+    This is the durable alternative to relying on a prompt instruction
+    (e.g. a HERMES.md rule telling an LLM caller to always pass
+    client_name="hermes"): a prompt only takes effect if it's actually
+    loaded for a given invocation and the LLM remembers to follow it on
+    every call. An env var set once on the process is unconditional — every
+    write from that spawned instance is labeled, with no cooperation
+    required from whatever is calling the tool.
+    """
+    explicit = _sanitize_client_name(client_name)
+    if explicit:
+        return explicit
+    return _sanitize_client_name(os.environ.get("MEMORYBRIDGE_CLIENT_NAME"))
 
 
 MAX_TOKENS_DEFAULT     = 4000
@@ -229,7 +284,8 @@ def compress_memory(mem: dict, target_tokens: int = 50) -> dict:
 # =============================================================================
 
 _RESULT_FIELDS = {"id", "content", "category", "importance",
-                  "project_id", "tags", "token_count", "created_at"}
+                  "project_id", "tags", "token_count", "created_at", "client_name",
+                  "confidence", "expires_at", "status", "source"}
 
 
 def _clean_result(mem: dict) -> dict:
@@ -247,7 +303,8 @@ def get_memory(
     context_hint: Optional[str] = None,
     category: Optional[str] = None,
     max_tokens: int = MAX_TOKENS_DEFAULT,
-    compress: bool = True
+    compress: bool = True,
+    min_confidence: float = 0.0
 ) -> str:
     """
     Retrieve relevant memory slice within token budget.
@@ -258,6 +315,7 @@ def get_memory(
         category: Optional category filter
         max_tokens: Maximum tokens to return (default 4000)
         compress: Whether to compress memories to fit budget (default True)
+        min_confidence: Minimum confidence threshold (default 0.0)
     Returns:
         JSON with memories, token stats, and budget info
     """
@@ -274,19 +332,20 @@ def get_memory(
         # remaining token budget in decay-score order.
         hint_results = _store.search_hybrid(
             profile, context_hint, category=category,
-            limit=20, max_tokens=MAX_TOKENS_DEFAULT
+            limit=20, max_tokens=MAX_TOKENS_DEFAULT,
+            min_confidence=min_confidence
         )
         hint_ids = {m["id"] for m in hint_results}
 
         # Full list for budget fill — apply decay, exclude hint hits (added first)
-        all_memories = _store.get_memories(profile, category=category)
+        all_memories = _store.get_memories(profile, category=category, min_confidence=min_confidence)
         all_memories = apply_decay([m.copy() for m in all_memories], DECAY_CONFIG)
         remainder = [m for m in all_memories if m["id"] not in hint_ids]
         remainder.sort(key=lambda m: m.get("effective_score", 0), reverse=True)
 
         memories = hint_results + remainder
     else:
-        memories = _store.get_memories(profile, category=category)
+        memories = _store.get_memories(profile, category=category, min_confidence=min_confidence)
         memories = apply_decay([m.copy() for m in memories], DECAY_CONFIG)
         memories.sort(key=lambda m: m.get("effective_score", 0), reverse=True)
 
@@ -294,49 +353,115 @@ def get_memory(
     projects = profile_data["projects"]
     model_preferences = profile_data["model_preferences"]
 
-    overhead_tokens = (
-        count_tokens(json.dumps(identity)) +
-        count_tokens(json.dumps(projects)) +
-        count_tokens(json.dumps(model_preferences)) +
-        200
-    )
+    # #179: measure the real serialized cost of everything fixed in the
+    # response besides the memories array, rather than summing
+    # identity/projects/model_preferences measured compact (no indent, no
+    # surrounding keys) plus a flat 200-token guess for the gap. That guess
+    # was occasionally too small against real profile data — e.g. an 8-token
+    # overshoot at max_tokens=1000 against production identity/projects data,
+    # even after the per-memory fix below closed the much larger ~1.5x gap.
+    # Build the actual empty-memories skeleton and measure it directly; the
+    # +50 covers only the small digit-width variance in token_stats' own
+    # placeholder fields, not a structural guess.
+    skeleton = {
+        "profile": profile,
+        "identity": identity,
+        "memories": [],
+        "projects": projects,
+        "model_preferences": model_preferences,
+        "token_stats": {
+            "budget": max_tokens,
+            "served": 0,
+            "remaining": 0,
+            "memories_returned": 0,
+            "memories_available": len(memories),
+            "compressed_count": 0,
+            "overhead_tokens": 0,
+        },
+    }
+    overhead_tokens = (count_tokens(json.dumps(skeleton, indent=2)) +
+                       count_tokens(UNTRUSTED_NOTICE) + 60)
     available_for_memories = max(max_tokens - overhead_tokens, 0)
 
+    # #179: budget against the REAL serialized cost of each memory as it will
+    # actually appear in the response — id/category/importance/project_id/
+    # tags/token_count/created_at fields plus indent=2 whitespace — not the
+    # DB's content-only token_count. Summing per-memory estimates that don't
+    # account for JSON structure or tags under-counted the true payload by up
+    # to ~1.5x at the default budget; measuring what will actually be
+    # serialized fixes that at the source instead of patching the estimate.
     selected_memories = []
     tokens_used = 0
     for mem in memories:
-        mem_tokens = mem.get("token_count", count_memory_tokens(mem))
+        mem_tokens = count_tokens(json.dumps(_clean_result(mem), indent=2))
         if tokens_used + mem_tokens <= available_for_memories:
             selected_memories.append(mem)
             tokens_used += mem_tokens
         elif compress and tokens_used < available_for_memories:
             remaining = available_for_memories - tokens_used
             compressed = compress_memory(mem, target_tokens=remaining - 20)
-            if compressed.get("token_count", mem_tokens) <= remaining:
+            compressed_tokens = count_tokens(json.dumps(_clean_result(compressed), indent=2))
+            if compressed_tokens <= remaining:
                 selected_memories.append(compressed)
-                tokens_used += compressed.get("token_count", 0)
+                tokens_used += compressed_tokens
                 break
         else:
             break
 
-    total_tokens_served = tokens_used + overhead_tokens
-
-    response = {
-        "profile": profile,
-        "identity": identity,
-        "memories": [_clean_result(m) for m in selected_memories],
-        "projects": projects,
-        "model_preferences": model_preferences,
-        "token_stats": {
-            "budget": max_tokens,
-            "served": total_tokens_served,
-            "remaining": max(max_tokens - total_tokens_served, 0),
-            "memories_returned": len(selected_memories),
-            "memories_available": len(memories),
-            "compressed_count": sum(1 for m in selected_memories if m.get("compressed")),
-            "overhead_tokens": overhead_tokens
+    def _build_response(mems):
+        r = {
+            "profile": profile,
+            "identity": identity,
+            "memories": [_clean_result(m) for m in mems],
+            "projects": projects,
+            "model_preferences": model_preferences,
+            "token_stats": {
+                "budget": max_tokens,
+                "served": 0,       # filled in below from the real serialized size
+                "remaining": 0,
+                "memories_returned": len(mems),
+                "memories_available": len(memories),
+                "compressed_count": sum(1 for m in mems if m.get("compressed")),
+                "overhead_tokens": overhead_tokens
+            }
         }
-    }
+        # Untrusted-data framing (#178): the memories above are content, not
+        # instructions — user-written notes, ingested excerpts, or memories
+        # written by another model over the HTTP bridge. Added as a field
+        # rather than mutating each memory's "content" (the Streamlit UI
+        # displays that value verbatim; literal delimiter tags would leak
+        # into it).
+        if mems:
+            r["_security_notice"] = UNTRUSTED_NOTICE
+        return r
+
+    response = _build_response(selected_memories)
+
+    # #179 backstop: the greedy loop above measures each memory's cost in
+    # isolation, but its REAL marginal cost once embedded in the memories
+    # array differs slightly — one more level of indent nesting, the array's
+    # comma separators — which compounds across many selected items (measured
+    # 49 tokens over budget at max_tokens=8000 with 21 memories, even after
+    # the per-item fix above). Trim the lowest-ranked (last-selected) memory
+    # until the TRUE fully-assembled response actually fits, rather than
+    # trusting the isolated-item estimate to have gotten it exactly right.
+    while selected_memories and count_tokens(json.dumps(response, indent=2)) > max_tokens:
+        selected_memories.pop()
+        response = _build_response(selected_memories)
+
+    # #179: report what we're ACTUALLY about to return, measured directly,
+    # rather than a sum of the same per-memory estimates used for selection.
+    # served/remaining start as placeholders above; filling in their real
+    # digit-width can shift the token count by one (a run of digit characters
+    # can cross a BPE merge boundary), so re-measure once against the filled-in
+    # response rather than trusting the placeholder-based measurement — this
+    # must be exact, not merely close, since it's what the caller is told.
+    total_tokens_served = count_tokens(json.dumps(response, indent=2))
+    response["token_stats"]["served"] = total_tokens_served
+    response["token_stats"]["remaining"] = max(max_tokens - total_tokens_served, 0)
+    total_tokens_served = count_tokens(json.dumps(response, indent=2))
+    response["token_stats"]["served"] = total_tokens_served
+    response["token_stats"]["remaining"] = max(max_tokens - total_tokens_served, 0)
 
     _store.log_access("get_memory", profile,
                       f"hint={context_hint}, cat={category}, budget={max_tokens}",
@@ -344,7 +469,7 @@ def get_memory(
     log_to_analytics(
         tokens_served=total_tokens_served,
         memories_returned=len(selected_memories),
-        model="claude",
+        model=_caller_model(),
         profile=profile,
         operation="get_memory"
     )
@@ -359,7 +484,11 @@ def add_memory(
     tags: list[str] = None,
     project_id: Optional[str] = None,
     profile: str = None,
-    supersedes: list[str] = None
+    supersedes: list[str] = None,
+    client_name: Optional[str] = None,
+    confidence: float = 1.0,
+    expires_at: Optional[str] = None,
+    status: str = "active"
 ) -> str:
     """
     Add a new memory with automatic token counting and content-hash dedup.
@@ -375,6 +504,16 @@ def add_memory(
             fact changed (e.g. a job change, a moved deadline). Each is archived
             and stamped with a valid_until timestamp so it leaves normal recall
             but remains as history. Use for facts that changed, not rewordings.
+        client_name: Optional self-reported caller label (e.g. "hermes") for
+            multi-agent setups sharing this store over stdio. Distinct from
+            the transport-derived source field — unverified, sanitized to
+            lowercase [a-z0-9_-], max 32 chars. If omitted, falls back to
+            the MEMORYBRIDGE_CLIENT_NAME env var set on this process (a
+            durable per-instance default that doesn't depend on the caller
+            remembering to pass this argument).
+        confidence: Confidence score between 0.0 and 1.0 (default 1.0)
+        expires_at: Optional ISO timestamp when this memory expires (TTL)
+        status: Status indicator (default 'active')
     Returns:
         Confirmation with memory ID and token count, or duplicate status
     """
@@ -388,7 +527,9 @@ def add_memory(
         mid = _store.add_memory(profile, content,
                                 category=category, importance=importance,
                                 tags=tags, project_id=project_id,
-                                supersedes=supersedes)
+                                supersedes=supersedes, source=_caller_model(),
+                                client_name=_resolve_client_name(client_name),
+                                confidence=confidence, expires_at=expires_at, status=status)
     except GuardrailRejection as e:
         # Document-shaped content: return the structured error contract every
         # other validation path uses, instead of surfacing an unhandled MCP error.
@@ -437,7 +578,8 @@ def add_memories(
     category: str = "fact",
     importance: str = "medium",
     project: Optional[str] = None,
-    profile: str = None
+    profile: str = None,
+    client_name: Optional[str] = None
 ) -> str:
     """
     BATCH-ADD operation -- inserts multiple new memory rows. This does NOT edit
@@ -452,6 +594,8 @@ def add_memories(
         importance: Importance level for all facts
         project: Optional project association
         profile: Memory profile
+        client_name: Optional self-reported caller label (e.g. "hermes") —
+            see add_memory's client_name for details.
     Returns:
         Summary with all added memory IDs and total tokens
     """
@@ -476,7 +620,8 @@ def add_memories(
         try:
             mid = _store.add_memory(profile, fact,
                                     category=category, importance=importance,
-                                    project_id=project)
+                                    project_id=project, source=_caller_model(),
+                                    client_name=_resolve_client_name(client_name))
         except GuardrailRejection as e:
             rejected.append({
                 "reason": str(e),
@@ -585,6 +730,7 @@ def search_memory(
     profile: str = None,
     recency_boost: bool = True,
     include_related: bool = False,
+    min_confidence: float = 0.0,
 ) -> str:
     """
     Search memories using FTS5 BM25 with optional token budget.
@@ -597,6 +743,7 @@ def search_memory(
         profile: Memory profile
         recency_boost: Apply recency weighting (default: true when configured)
         include_related: Include related memories by entity tag overlap (default: false)
+        min_confidence: Minimum confidence threshold (default 0.0)
     Returns:
         JSON with ranked results (internal fields stripped)
     """
@@ -610,29 +757,44 @@ def search_memory(
     results = _store.search_hybrid(profile, query, category=category,
                                    limit=limit, max_tokens=max_tokens,
                                    recency_boost=recency_boost,
-                                   include_related=include_related)
+                                   include_related=include_related,
+                                   min_confidence=min_confidence)
 
     # Boost relevance score for all returned memories in a single commit (issue #12)
     _store.boost_batch(profile, [m["id"] for m in results],
                        boost=DECAY_CONFIG.get("boost_on_access", 0.1))
 
-    tokens_served = sum(m.get("token_count", 0) for m in results)
+    response = {
+        "query": query,
+        "profile": profile,
+        "results": [_clean_result(m) for m in results],
+        "total_matches": len(results),
+        "tokens_served": 0,     # filled in below from the real serialized size
+    }
+    # Untrusted-data framing (#178) — see the matching comment in get_memory.
+    if results:
+        response["_security_notice"] = UNTRUSTED_NOTICE
+
+    # #179: same fix as get_memory — report the actual serialized cost
+    # (fields + tags + indent=2 whitespace + the security notice), not a sum
+    # of the DB's content-only token_count per result. Two passes: filling in
+    # the real digit width after the first measurement can shift the count by
+    # one (see the matching comment in get_memory).
+    tokens_served = count_tokens(json.dumps(response, indent=2))
+    response["tokens_served"] = tokens_served
+    tokens_served = count_tokens(json.dumps(response, indent=2))
+    response["tokens_served"] = tokens_served
+
     _store.log_access("search_memory", profile,
                       f"query='{query}', results={len(results)}", tokens_served)
     log_to_analytics(
         tokens_served=tokens_served,
         memories_returned=len(results),
-        model="claude",
+        model=_caller_model(),
         profile=profile,
         operation="search_memory"
     )
-    return json.dumps({
-        "query": query,
-        "profile": profile,
-        "results": [_clean_result(m) for m in results],
-        "total_matches": len(results),
-        "tokens_served": tokens_served
-    }, indent=2)
+    return json.dumps(response, indent=2)
 
 
 @mcp.tool()
@@ -665,6 +827,110 @@ def reflect(
 
 
 @mcp.tool()
+def consolidate_session(
+    session_notes: str,
+    profile: Optional[str] = None,
+    project_id: Optional[str] = None
+) -> str:
+    """
+    Session consolidation tool (Memory Promotion System).
+    Analyzes raw session notes/events, deduplicates against existing store,
+    and synthesizes durable candidate facts, decisions, and procedural rules.
+
+    Args:
+        session_notes: Raw events, tool outputs, or bullet points from the session
+        profile: Memory profile (default: current active profile)
+        project_id: Optional project association
+    Returns:
+        JSON summary of promoted, duplicate, or rejected candidate memories
+    """
+    profile = profile or _active_profile()
+    _store.ensure_profile(profile)
+
+    lines = [ln.strip() for ln in session_notes.splitlines() if ln.strip()]
+    candidates = []
+    for line in lines:
+        if line.startswith(("- ", "* ", "1. ", "2. ", "3. ", "4. ", "5. ")):
+            clean = line.lstrip("-*0123456789. ").strip()
+            if len(clean) > 10:
+                candidates.append(clean)
+    if not candidates:
+        candidates = [session_notes.strip()]
+
+    added = []
+    duplicates = []
+    rejected = []
+
+    for candidate in candidates[:5]:  # Max 5 promotions per session
+        cat = "procedural" if any(w in candidate.lower() for w in ["step", "fix", "workflow", "how to", "use ", "command", "requires"]) else "fact"
+        try:
+            mid = _store.add_memory(
+                profile, candidate,
+                category=cat,
+                importance="high",
+                project_id=project_id,
+                source=_caller_model(),
+                confidence=0.9
+            )
+            if mid:
+                added.append({"memory_id": mid, "content": candidate, "category": cat})
+            else:
+                duplicates.append(candidate)
+        except GuardrailRejection as e:
+            rejected.append({"content": candidate, "reason": str(e)})
+
+    _store.log_access("consolidate_session", profile, f"added={len(added)}, duplicates={len(duplicates)}, rejected={len(rejected)}")
+    return json.dumps({
+        "status": "consolidated",
+        "profile": profile,
+        "added_count": len(added),
+        "duplicate_count": len(duplicates),
+        "rejected_count": len(rejected),
+        "promoted_memories": added,
+        "rejected": rejected
+    }, indent=2)
+
+
+@mcp.tool()
+def add_memory_edge(
+    source_id: str,
+    target_id: str,
+    relation: str = "relates_to"
+) -> str:
+    """
+    Create a directed knowledge graph edge between two memories.
+
+    Args:
+        source_id: Origin memory ID
+        target_id: Target memory ID
+        relation: Relation tag (e.g. 'supersedes', 'depends_on', 'relates_to', 'part_of')
+    Returns:
+        JSON confirmation with new edge ID
+    """
+    try:
+        edge_id = _store.add_edge(source_id, target_id, relation=relation)
+        return json.dumps({"status": "edge_created", "edge_id": edge_id, "source_id": source_id, "target_id": target_id, "relation": relation}, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_memory_edges(
+    memory_id: str
+) -> str:
+    """
+    Retrieve knowledge graph edges connected to a memory.
+
+    Args:
+        memory_id: Memory ID to query
+    Returns:
+        JSON list of connected edges
+    """
+    edges = _store.get_edges(memory_id)
+    return json.dumps({"memory_id": memory_id, "edges": edges, "count": len(edges)}, indent=2)
+
+
+@mcp.tool()
 def delete_memory(
     memory_id: str,
     profile: str = None
@@ -685,6 +951,60 @@ def delete_memory(
         "memory_id": memory_id,
         "tokens_freed": tokens_freed,
         "profile": profile
+    }, indent=2)
+
+
+@mcp.tool()
+def bulk_delete(
+    ids: list[str],
+    profile: str = None
+) -> str:
+    """
+    Delete multiple memories by ID in a single operation.
+
+    Iterates over the supplied IDs, deleting each one. Returns per-id results
+    (deleted or not_found) and the total tokens freed across all successful
+    deletions. Destructive — local stdio only, never exposed over the HTTP
+    bridge (not in REMOTE_ALLOWED_TOOLS), per the security rule in CLAUDE.md.
+
+    Args:
+        ids: List of memory IDs to delete (e.g. ["mem_abc123", "mem_def456"])
+        profile: Memory profile
+    Returns:
+        JSON with status, per-id results, counts, and total tokens freed
+    """
+    profile = profile or _active_profile()
+    if not ids:
+        return json.dumps({"error": "ids list is empty"})
+    if _store.get_profile(profile) is None:
+        return json.dumps({"error": f"Profile '{profile}' not found"})
+
+    results = []
+    deleted_count = 0
+    not_found_count = 0
+    total_tokens_freed = 0
+
+    for mid in ids:
+        tokens_freed = _store.delete_memory(profile, mid)
+        if tokens_freed > 0:
+            deleted_count += 1
+            total_tokens_freed += tokens_freed
+            results.append({"id": mid, "status": "deleted", "tokens_freed": tokens_freed})
+        else:
+            not_found_count += 1
+            results.append({"id": mid, "status": "not_found", "tokens_freed": 0})
+
+    _store.log_access("bulk_delete", profile,
+                      f"requested={len(ids)}, deleted={deleted_count}, "
+                      f"not_found={not_found_count}, freed={total_tokens_freed} tokens")
+    return json.dumps({
+        "status": "completed",
+        "profile": profile,
+        "requested_count": len(ids),
+        "deleted_count": deleted_count,
+        "not_found_count": not_found_count,
+        "total_tokens_freed": total_tokens_freed,
+        "results": results
     }, indent=2)
 
 
@@ -788,6 +1108,26 @@ def prune_memories(
         "pruned_count": len(pruned_ids),
         "pruned_ids": pruned_ids,
         "profile": profile
+    }, indent=2)
+
+
+@mcp.tool()
+def list_profiles() -> str:
+    """
+    List available profile names. Read-only — does not switch the active
+    profile (see switch_profile for that; it stays local-only).
+
+    Remote clients are pinned to the default profile when no `profile`
+    argument is given, but tools like get_memory/search_memory DO honor an
+    explicit profile= argument remotely. This lets a remote client discover
+    what profile names exist to pass, instead of guessing blind (#180).
+
+    Returns:
+        JSON with the list of profile names and which one is the default.
+    """
+    return json.dumps({
+        "profiles": _store.list_profiles(),
+        "default_profile": DEFAULT_PROFILE,
     }, indent=2)
 
 
@@ -982,6 +1322,84 @@ def export_passport(
     )
 
 
+# --------------------------------------------------------------------------- #
+# ws_* workspace tools (F1) — sandboxed scratch/reference filesystem for
+# non-Claude-Code MCP clients (ChatGPT, Gemini, Perplexity). See F1/F4 in
+# docs/MULTI_MODEL_FEATURES.md. Implementation lives in workspace.py; these
+# are thin @mcp.tool() wrappers, same pattern as get_memory/add_memory above.
+# --------------------------------------------------------------------------- #
+
+@mcp.tool()
+def ws_status() -> str:
+    """
+    Report the workspace root, file count, and current write allowlist.
+
+    Returns:
+        JSON with root path, file_count, and write_allowed prefixes.
+    """
+    return json.dumps(workspace.ws_status(), indent=2)
+
+
+@mcp.tool()
+def ws_list(path: str = "", recursive: bool = False) -> str:
+    """
+    List entries under the workspace (or a subdirectory of it).
+
+    Args:
+        path: Subdirectory relative to the workspace root (default: root)
+        recursive: If True, list all nested entries, not just the top level
+    Returns:
+        JSON with the listed path and its entries.
+    """
+    return json.dumps(workspace.ws_list(path, recursive=recursive), indent=2)
+
+
+@mcp.tool()
+def ws_read(path: str) -> str:
+    """
+    Read a text file from the workspace.
+
+    Args:
+        path: File path relative to the workspace root
+    Returns:
+        JSON with the file content, or a structured error (not found, binary).
+    """
+    return json.dumps(workspace.ws_read(path), indent=2)
+
+
+@mcp.tool()
+def ws_write(path: str, content: str, overwrite: bool = False) -> str:
+    """
+    Write a text file to the workspace. Deny-by-default: only paths under a
+    configured `workspace_write_allowed` prefix may be written.
+
+    Over the HTTP bridge (remote mode), overwrite=True is required even for
+    a brand-new file — see F4 in docs/MULTI_MODEL_FEATURES.md.
+
+    Args:
+        path: File path relative to the workspace root
+        content: Text content to write
+        overwrite: Required to replace an existing file (or, remotely, to write at all)
+    Returns:
+        JSON with bytes_written, or a structured error.
+    """
+    return json.dumps(workspace.ws_write(path, content, overwrite=overwrite), indent=2)
+
+
+@mcp.tool()
+def ws_search(query: str, path: str = "") -> str:
+    """
+    Search workspace text files for a substring match.
+
+    Args:
+        query: Plain substring to search for
+        path: Subdirectory relative to the workspace root (default: whole root)
+    Returns:
+        JSON with the query and the list of matching file paths.
+    """
+    return json.dumps(workspace.ws_search(query, path), indent=2)
+
+
 @mcp.tool()
 def ingest_from_inbox(
     profile: str = None,
@@ -1143,6 +1561,29 @@ def _start_parent_watchdog() -> None:
 REMOTE_ALLOWED_TOOLS = {
     "get_memory", "search_memory", "reflect", "add_memory",
     "list_projects", "export_passport",
+    # export_for_model (#180): the ChatGPT/Gemini/Ollama-formatted exports
+    # exist specifically for non-Claude remote clients to consume, but were
+    # never reachable from the bridge those clients connect through — only
+    # Claude stdio and the Streamlit UI could call it, so using it remotely
+    # meant generating a blob locally and pasting it in by hand, the exact
+    # manual workflow the bridge exists to replace. Read-only, no new risk.
+    "export_for_model",
+    # list_profiles (#180): switch_profile stays excluded — it mutates
+    # _current_profile, global state a remote model shouldn't control. But
+    # get_memory/search_memory/etc. all accept an explicit profile= argument
+    # that IS honored remotely (remote mode only pins the *default* when one
+    # isn't given), so a remote client was access-unblocked but
+    # discovery-blind: it could reach a non-default profile if it happened to
+    # guess the name, with no way to learn what names exist. This is a
+    # read-only enumeration of names only — no identity/content/memory data.
+    "list_profiles",
+    # F1 workspace read tools — ws_write intentionally excluded here; it is
+    # added to this allowlist only once the F4 remote-write guard exists
+    # (it now does, in workspace.py, but per the F1/F4 doc the allowlist
+    # change and the guard must land in the same commit as a deliberate
+    # decision, not a byproduct of ws_write existing). See F4 acceptance
+    # criteria in docs/MULTI_MODEL_FEATURES.md.
+    "ws_status", "ws_list", "ws_read", "ws_search",
 }
 
 
@@ -1240,16 +1681,36 @@ class _RateLimitAuthMiddleware:
 
     def _token_ok(self, scope) -> bool:
         segment = scope.get("path", "").lstrip("/").split("/", 1)[0]
+        # secrets.compare_digest raises TypeError on a non-ASCII str rather
+        # than returning False (issue #177) — uvicorn decodes a percent-encoded
+        # non-ASCII path segment to UTF-8 before scope reaches here, so an
+        # unauthenticated request could crash this pre-auth check with a 500
+        # instead of the uniform 404 every other bad token gets.
+        if not segment.isascii():
+            return False
         return secrets.compare_digest(segment, self.expected_token)
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
-        if not self._rate_ok(self._client_ip(scope)):
+        # This is a pre-auth boundary parsing attacker-controlled input (path,
+        # headers) from the open internet. Any unexpected exception here must
+        # not become an unauthenticated 500 (issue #177) — that both discloses
+        # more than a uniform 404 and, since it's logged, is a free remote log
+        # amplification vector. Fail closed to 404, log the exception type only.
+        try:
+            rate_ok = self._rate_ok(self._client_ip(scope))
+            token_ok = self._token_ok(scope) if rate_ok else True
+        except Exception as e:
+            print(f"[memorybridge] auth middleware error (denying request): "
+                  f"{type(e).__name__}", file=sys.stderr)
+            await _send_plain(send, 404, "not found")
+            return
+        if not rate_ok:
             await _send_plain(send, 429, "rate limit exceeded")
             return
-        if not self._token_ok(scope):
+        if not token_ok:
             await _send_plain(send, 404, "not found")
             return
         await self.app(scope, receive, send)
@@ -1270,6 +1731,7 @@ def _run_http() -> None:
     # writes that arrive over this bridge (see add_memory / issue #37).
     global _REMOTE_MODE
     _REMOTE_MODE = True
+    workspace.set_remote_mode(True)  # F4: ws_write now requires overwrite=True
 
     token = os.environ.get("MEMORYBRIDGE_TOKEN", "").strip()
     if len(token) < 32:

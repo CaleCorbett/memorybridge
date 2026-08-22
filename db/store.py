@@ -158,6 +158,37 @@ def _mem_id() -> str:
     return f"mem_{uuid.uuid4().hex[:8]}"
 
 
+def _pack_vector(vec: list[float]) -> bytes:
+    """Pack a float vector into a compact float32 BLOB (issue #181 P2-1).
+
+    Replaces json.dumps(vec) storage: no repeated ASCII-float formatting on
+    write, no json.loads()/parsing (~81ms per semantic search across a
+    profile) on read, and roughly a quarter of the on-disk size of the
+    JSON-text equivalent.
+    """
+    import numpy as np
+    return np.asarray(vec, dtype=np.float32).tobytes()
+
+
+def _unpack_vector(blob) -> list[float] | None:
+    """Inverse of _pack_vector. Returns None (not raise) on unparseable input
+    so a corrupt/legacy row can't crash search_semantic — same fail-soft
+    contract the old json.loads()/except JSONDecodeError path had."""
+    if blob is None:
+        return None
+    import numpy as np
+    try:
+        if isinstance(blob, (bytes, bytearray, memoryview)):
+            return np.frombuffer(blob, dtype=np.float32).tolist()
+        # Backward-compat: a row that hasn't been migrated from JSON text yet
+        # (should not happen post-migration, but fail soft rather than crash).
+        if isinstance(blob, str):
+            return json.loads(blob)
+    except Exception:
+        return None
+    return None
+
+
 class MemoryStore:
     """
     SQLite-backed memory store with WAL mode, FTS5 search, and content-hash dedup.
@@ -348,11 +379,16 @@ class MemoryStore:
                    tags: list = None, project_id: str = None,
                    enforce_guardrail: bool = True,
                    skip_enrichment: bool = False,
-                   supersedes: list[str] | None = None) -> str | None:
+                   supersedes: list[str] | None = None,
+                   source: str | None = None,
+                   client_name: str | None = None,
+                   confidence: float = 1.0,
+                   expires_at: str | None = None,
+                   status: str = "active") -> str | None:
         """Returns memory ID on success, None if exact duplicate.
 
         Raises GuardrailRejection if content is document-shaped (too long, too
-        many lines, or markdown-heading/multi-section). Pass
+        many lines, or markdown-heading/multi-section) or contains secrets. Pass
         enforce_guardrail=False only for trusted internal migrations.
 
         Pass skip_enrichment=True for internal auto-saves (conversation
@@ -363,6 +399,14 @@ class MemoryStore:
         it drops out of default retrieval but stays queryable as history. Use
         this when a fact CHANGES ("left the job", "moved cities") rather than
         when it is merely reworded (which the fuzzy merge handles).
+
+        *source* — write provenance (#180): "claude" (local stdio) or
+        "remote" (HTTP bridge) from server.py's _caller_model(). None for
+        internal/migration writes that don't go through an MCP tool call.
+
+        *client_name* — self-reported caller label (e.g. "hermes"), already
+        sanitized by the caller (server.py's add_memory/add_memories tools).
+        Unverified, unlike *source* — a caller can claim to be anything.
         """
         if enforce_guardrail:
             ok, reason = guardrail_check(content)
@@ -407,10 +451,12 @@ class MemoryStore:
                 self._conn.execute(
                     """INSERT INTO memories
                        (id,profile,content,content_hash,category,importance,
-                        created_at,last_accessed,tags,project_id,token_count)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                        created_at,last_accessed,tags,project_id,token_count,source,client_name,
+                        confidence,expires_at,status)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (mid, profile, content, h, category, importance,
-                     now, now, json.dumps(enriched_tags or []), project_id, tc)
+                     now, now, json.dumps(enriched_tags or []), project_id, tc, source, client_name,
+                     float(confidence), expires_at, status)
                 )
                 # Supersession: invalidate the facts this one replaces, in the
                 # same transaction so the swap is atomic (#temporal).
@@ -639,10 +685,11 @@ class MemoryStore:
     # -------------------------------------------------------------------------
 
     def get_memories(self, profile: str, category: str = None,
-                     max_tokens: int = None) -> list[dict]:
+                     max_tokens: int = None, min_confidence: float = 0.0) -> list[dict]:
         """Return active memories, ranked by relevance_score desc."""
-        sql = "SELECT * FROM memories WHERE profile=? AND archived=0"
-        params = [profile]
+        now_str = datetime.now().isoformat()
+        sql = "SELECT * FROM memories WHERE profile=? AND archived=0 AND confidence>=? AND (expires_at IS NULL OR expires_at > ?)"
+        params = [profile, min_confidence, now_str]
         if category:
             sql += " AND category=?"
             params.append(category)
@@ -661,7 +708,7 @@ class MemoryStore:
         return mems
 
     def search(self, profile: str, query: str, category: str = None,
-               limit: int = 5, max_tokens: int = 800) -> list[dict]:
+               limit: int = 5, max_tokens: int = 800, min_confidence: float = 0.0) -> list[dict]:
         """FTS5 BM25 search with token budget."""
         # Sanitize each term for FTS5
         terms = [t for t in query.split() if len(t) > 1]
@@ -669,6 +716,7 @@ class MemoryStore:
             return []
         safe_query = " OR ".join(f'"{t}"' for t in terms)
 
+        now_str = datetime.now().isoformat()
         sql = """
             SELECT m.*, bm25(memories_fts) AS bm25_score
             FROM memories_fts
@@ -676,8 +724,10 @@ class MemoryStore:
             WHERE memories_fts MATCH ?
               AND m.profile = ?
               AND m.archived = 0
+              AND m.confidence >= ?
+              AND (m.expires_at IS NULL OR m.expires_at > ?)
         """
-        params = [safe_query, profile]
+        params = [safe_query, profile, min_confidence, now_str]
         if category:
             sql += " AND m.category = ?"
             params.append(category)
@@ -690,9 +740,9 @@ class MemoryStore:
             logging.warning("FTS5 parse error for query %r: %s — falling back to LIKE search", query, fts_err)
             like_pattern = f"%{query}%"
             like_sql = (
-                "SELECT * FROM memories WHERE profile=? AND archived=0 AND content LIKE ?"
+                "SELECT * FROM memories WHERE profile=? AND archived=0 AND confidence>=? AND (expires_at IS NULL OR expires_at > ?) AND content LIKE ?"
             )
-            like_params = [profile, like_pattern]
+            like_params = [profile, min_confidence, now_str, like_pattern]
             if category:
                 like_sql += " AND category=?"
                 like_params.append(category)
@@ -952,7 +1002,15 @@ class MemoryStore:
             with self._embed_lock:
                 if self._embed_model is None:
                     from fastembed import TextEmbedding
-                    self._embed_model = TextEmbedding("BAAI/bge-small-en-v1.5")
+                    # Pin the model cache to a persistent location. FastEmbed's
+                    # default is tempfile.gettempdir()/fastembed_cache, which on
+                    # macOS is /var/folders/.../T/ — purged after ~3 days of
+                    # inactivity. A search landing mid-re-download then fails
+                    # with a transient "utf-8 codec can't decode" error.
+                    self._embed_model = TextEmbedding(
+                        "BAAI/bge-small-en-v1.5",
+                        cache_dir=str(Path.home() / ".cache" / "fastembed"),
+                    )
         return self._embed_model
 
     def _embed_texts(self, texts: list[str]) -> list[list[float]]:
@@ -976,7 +1034,7 @@ class MemoryStore:
                     self._conn.execute(
                         "INSERT OR REPLACE INTO memory_embeddings(id, profile, vector) "
                         "VALUES(?,?,?)",
-                        (memory_id, profile, json.dumps(vec))
+                        (memory_id, profile, _pack_vector(vec))
                     )
                     self._conn.commit()
             return True
@@ -1025,7 +1083,7 @@ class MemoryStore:
                 self._conn.executemany(
                     "INSERT OR REPLACE INTO memory_embeddings(id, profile, vector) "
                     "VALUES(?,?,?)",
-                    [(r["id"], r["profile"], json.dumps(v))
+                    [(r["id"], r["profile"], _pack_vector(v))
                      for r, v in zip(rows, vectors)]
                 )
                 self._conn.commit()
@@ -1051,6 +1109,15 @@ class MemoryStore:
             "CREATE INDEX IF NOT EXISTS idx_analytics_model ON analytics_events(model)",
             "CREATE INDEX IF NOT EXISTS idx_prune_queue_candidate ON prune_queue(candidate_id, resolved)",
             "CREATE INDEX IF NOT EXISTS idx_pruner_log_candidate ON pruner_log(candidate_id)",
+            """CREATE TABLE IF NOT EXISTS memory_edges (
+                id           TEXT PRIMARY KEY,
+                source_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                target_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                relation     TEXT NOT NULL,
+                created_at   TEXT NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_edge_source ON memory_edges(source_id)",
+            "CREATE INDEX IF NOT EXISTS idx_edge_target ON memory_edges(target_id)",
         ):
             try:
                 self._conn.execute(ddl)
@@ -1065,6 +1132,19 @@ class MemoryStore:
                 self._conn.execute("ALTER TABLE memories ADD COLUMN valid_until TEXT")
             if "superseded_by" not in cols:
                 self._conn.execute("ALTER TABLE memories ADD COLUMN superseded_by TEXT")
+            if "source" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN source TEXT")
+            if "client_name" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN client_name TEXT")
+            if "confidence" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0")
+            if "expires_at" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN expires_at TEXT")
+            if "status" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+            pruner_log_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(pruner_log)").fetchall()}
+            if pruner_log_cols and "content" not in pruner_log_cols:
+                self._conn.execute("ALTER TABLE pruner_log ADD COLUMN content TEXT")
         except Exception:
             pass
         try:
@@ -1073,10 +1153,14 @@ class MemoryStore:
             days = 90
         if days > 0:
             cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+            # pruner_log is exempt (#175): it's the only durable record of what
+            # an auto-deletion destroyed. access_log/analytics_events are
+            # high-volume telemetry where 90 days is the right tradeoff;
+            # pruner_log is a low-volume audit trail of irreversible actions
+            # and should outlive the DELETE it describes.
             for sql, params in (
                 ("DELETE FROM access_log WHERE ts < ?", (cutoff,)),
                 ("DELETE FROM analytics_events WHERE created_at < ?", (cutoff,)),
-                ("DELETE FROM pruner_log WHERE created_at < ?", (cutoff,)),
                 ("DELETE FROM prune_queue WHERE resolved=1 AND resolved_at IS NOT NULL AND resolved_at < ?", (cutoff,)),
             ):
                 try:
@@ -1087,6 +1171,85 @@ class MemoryStore:
             self._conn.commit()
         except Exception:
             pass
+
+        self._migrate_embeddings_v2()
+
+    def _migrate_embeddings_v2(self) -> None:
+        """One-time hygiene for issue #181 (P2-1), run on EVERY construction —
+        unlike the fresh-DB-only purge in __init__ (#4), this repairs DBs that
+        were already initialized before this fix existed, which is exactly the
+        case that let 440/1144 embedding rows sit orphaned forever (the old
+        purge only ran inside ``if not already_init``, a branch an existing DB
+        never takes again). Two independent problems, both idempotent:
+
+        1. Purge memory_embeddings rows whose parent memory no longer exists.
+           FK ON DELETE CASCADE only fires for deletes that happen *after*
+           ``PRAGMA foreign_keys=ON`` was set on the deleting connection; rows
+           orphaned before that (or by any out-of-band write) are permanent
+           without an explicit sweep like this one.
+        2. Convert any vector still stored as JSON text (pre-BLOB rows) to a
+           packed float32 BLOB, so every row benefits from the parse-free read
+           path in search_semantic regardless of which version wrote it.
+
+        Guarded by a meta flag per logical migration step so a large table
+        doesn't get re-scanned on every process start once it's clean.
+        """
+        try:
+            purged_flag = self._conn.execute(
+                "SELECT value FROM meta WHERE key='embeddings_orphan_purge_v1'"
+            ).fetchone()
+            if not purged_flag:
+                cur = self._conn.execute(
+                    "DELETE FROM memory_embeddings "
+                    "WHERE id NOT IN (SELECT id FROM memories)"
+                )
+                purged = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO meta VALUES('embeddings_orphan_purge_v1', ?)",
+                    (datetime.now().isoformat(),)
+                )
+                self._conn.commit()
+                if purged:
+                    import sys
+                    print(f"[memorybridge] purged {purged} orphaned embedding rows",
+                          file=sys.stderr)
+        except Exception as e:
+            logger.warning("Orphan embedding purge skipped: %s", e)
+
+        try:
+            blob_flag = self._conn.execute(
+                "SELECT value FROM meta WHERE key='embeddings_blob_migration_v1'"
+            ).fetchone()
+            if not blob_flag:
+                rows = self._conn.execute(
+                    "SELECT id, vector FROM memory_embeddings"
+                ).fetchall()
+                converted = 0
+                with self._conn.transaction():
+                    for row in rows:
+                        v = row["vector"]
+                        if isinstance(v, str):
+                            try:
+                                vec = json.loads(v)
+                            except (json.JSONDecodeError, TypeError):
+                                continue
+                            if isinstance(vec, list):
+                                self._conn.execute(
+                                    "UPDATE memory_embeddings SET vector=? WHERE id=?",
+                                    (_pack_vector(vec), row["id"])
+                                )
+                                converted += 1
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO meta VALUES('embeddings_blob_migration_v1', ?)",
+                        (datetime.now().isoformat(),)
+                    )
+                    self._conn.commit()
+                if converted:
+                    import sys
+                    print(f"[memorybridge] migrated {converted} embedding rows from JSON to BLOB",
+                          file=sys.stderr)
+        except Exception as e:
+            logger.warning("Embedding BLOB migration skipped: %s", e)
 
     def embeddings_available(self) -> bool:
         """True if the embedding model can actually embed text. Used as an
@@ -1129,7 +1292,7 @@ class MemoryStore:
 
         self._conn.executemany(
             "INSERT OR REPLACE INTO memory_embeddings(id, profile, vector) VALUES(?,?,?)",
-            [(mid, profile, json.dumps(vec)) for mid, vec in zip(ids, vectors)]
+            [(mid, profile, _pack_vector(vec)) for mid, vec in zip(ids, vectors)]
         )
         self._conn.commit()
         return len(ids)
@@ -1170,9 +1333,15 @@ class MemoryStore:
             return self.search(profile, query, limit=limit, max_tokens=max_tokens)
         q_len = len(q_vec)
 
-        # Fetch all embedding rows for profile
+        # Fetch embedding rows for profile, joined against memories to exclude
+        # archived ones (issue #181 P2-1): archived memories are unreachable
+        # via normal reads (archived=0 is hardcoded on every read path) but
+        # their embeddings were still being loaded and scored on every
+        # semantic search — pure wasted work once a memory is archived.
         rows = self._conn.execute(
-            "SELECT e.id, e.vector FROM memory_embeddings e WHERE e.profile=?",
+            "SELECT e.id, e.vector FROM memory_embeddings e "
+            "JOIN memories m ON m.id = e.id "
+            "WHERE e.profile=? AND m.archived=0",
             (profile,)
         ).fetchall()
 
@@ -1185,11 +1354,7 @@ class MemoryStore:
         mat: list[list[float]] = []
         mismatched = 0
         for row in rows:
-            try:
-                vec = json.loads(row["vector"])
-            except (json.JSONDecodeError, TypeError):
-                mismatched += 1
-                continue
+            vec = _unpack_vector(row["vector"])
             if not isinstance(vec, list) or len(vec) != q_len:
                 mismatched += 1
                 continue
@@ -1252,7 +1417,8 @@ class MemoryStore:
                       category: str = None,
                       limit: int = 5, max_tokens: int = 800,
                       recency_boost: bool = True,
-                      include_related: bool = False) -> list[dict]:
+                      include_related: bool = False,
+                      min_confidence: float = 0.0) -> list[dict]:
         """
         Reciprocal Rank Fusion of FTS5 BM25 + semantic cosine results.
         RRF score = sum(1 / (60 + rank)) across both lists.
@@ -1261,9 +1427,11 @@ class MemoryStore:
         *recency_boost* — when True (default), applies recency weighting.
         *include_related* — when True (default), expands results with
         entity-tag-related memories.
+        *min_confidence* — filter out memories below confidence threshold.
         """
         keyword_results = self.search(profile, query, category=category,
-                                      limit=limit * 2, max_tokens=max_tokens * 2)
+                                      limit=limit * 2, max_tokens=max_tokens * 2,
+                                      min_confidence=min_confidence)
         semantic_results = self.search_semantic(profile, query, limit=limit * 2,
                                                 max_tokens=max_tokens * 2)
 
@@ -1446,3 +1614,41 @@ class MemoryStore:
             return results
 
         return results + related
+
+    # -------------------------------------------------------------------------
+    # Graph Memory Edges
+    # -------------------------------------------------------------------------
+
+    def add_edge(self, source_id: str, target_id: str, relation: str = "relates_to") -> str:
+        """Create a directed relation edge between two memories."""
+        edge_id = f"edge_{uuid.uuid4().hex[:12]}"
+        now = datetime.now().isoformat()
+        with self._conn.transaction():
+            self._conn.execute(
+                """INSERT INTO memory_edges (id, source_id, target_id, relation, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (edge_id, source_id, target_id, relation, now)
+            )
+            self._conn.commit()
+        return edge_id
+
+    def get_edges(self, memory_id: str) -> list[dict]:
+        """Get graph edges connected to a memory (outgoing and incoming)."""
+        rows = self._conn.execute(
+            """SELECT e.*, m1.content as source_content, m2.content as target_content
+               FROM memory_edges e
+               LEFT JOIN memories m1 ON e.source_id = m1.id
+               LEFT JOIN memories m2 ON e.target_id = m2.id
+               WHERE e.source_id = ? OR e.target_id = ?
+               ORDER BY e.created_at DESC""",
+            (memory_id, memory_id)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_edge(self, edge_id: str) -> bool:
+        """Delete a graph edge by ID."""
+        with self._conn.transaction():
+            cur = self._conn.execute("DELETE FROM memory_edges WHERE id=?", (edge_id,))
+            deleted = cur.rowcount > 0
+            self._conn.commit()
+        return deleted
