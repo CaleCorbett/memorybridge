@@ -320,6 +320,55 @@ def cmd_maintain(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_edges(args: argparse.Namespace) -> int:
+    """Manage graph memory edges: list, add, rm."""
+    data = config.data_dir()
+    db_path = data / "memory.db"
+    if not db_path.exists():
+        print(f"Database not found: {db_path} (run `mb init` first)")
+        return 1
+        
+    os.environ.setdefault("MEMORYBRIDGE_NO_EMBED", "1")
+    from db.store import MemoryStore
+    store = MemoryStore(db_path)
+    
+    if args.action == "list":
+        if args.memory_id:
+            rows = store.get_edges(args.memory_id)
+            if not rows:
+                print(f"No edges found for memory {args.memory_id}.")
+                return 0
+            for r in rows:
+                print(f"{r['id']}: {r['source_id']} --[{r['relation']}]--> {r['target_id']}")
+        else:
+            rows = store._conn.execute("SELECT * FROM memory_edges ORDER BY created_at DESC LIMIT 50").fetchall()
+            if not rows:
+                print("No edges found in the database.")
+                return 0
+            for r in rows:
+                print(f"{r['id']}: {r['source_id']} --[{r['relation']}]--> {r['target_id']}")
+            if len(rows) == 50:
+                print("(Showing 50 most recent edges. Pass --memory-id to filter.)")
+                
+    elif args.action == "add":
+        try:
+            edge_id = store.add_edge(args.source_id, args.target_id, args.relation)
+            print(f"Created edge {edge_id}: {args.source_id} --[{args.relation}]--> {args.target_id}")
+        except Exception as e:
+            print(f"Failed to add edge: {e}")
+            return 1
+            
+    elif args.action == "rm":
+        deleted = store.delete_edge(args.edge_id)
+        if deleted:
+            print(f"Deleted edge {args.edge_id}")
+        else:
+            print(f"Edge {args.edge_id} not found")
+            return 1
+            
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mb", description="MemoryBridge — cross-model memory server")
     sub = p.add_subparsers(dest="command", required=True)
@@ -354,6 +403,18 @@ def build_parser() -> argparse.ArgumentParser:
     mt.add_argument("--weekly", action="store_true", help="run weekly maintenance & health report")
     mt.add_argument("--profile", default="default", help="target profile")
     mt.set_defaults(func=cmd_maintain)
+
+    edg = sub.add_parser("edges", help="manage knowledge graph edges")
+    edg_sub = edg.add_subparsers(dest="action", required=True)
+    el = edg_sub.add_parser("list", help="list graph edges")
+    el.add_argument("--memory-id", help="filter edges by a specific memory ID")
+    ea = edg_sub.add_parser("add", help="create a directed edge between memories")
+    ea.add_argument("source_id", help="ID of the source memory")
+    ea.add_argument("target_id", help="ID of the target memory")
+    ea.add_argument("--relation", default="relates_to", help="relation type (default: relates_to)")
+    er = edg_sub.add_parser("rm", help="delete a graph edge")
+    er.add_argument("edge_id", help="ID of the edge to delete")
+    edg.set_defaults(func=cmd_edges)
 
     return p
 

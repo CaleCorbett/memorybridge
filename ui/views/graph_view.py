@@ -20,6 +20,24 @@ def render():
     st.header("🕸️ Knowledge Graph")
     st.caption("Directed relations between memories (Memory Engineering v5)")
 
+    with st.expander("➕ Add New Edge"):
+        with st.form("add_edge_form"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                src = st.text_input("Source Memory ID")
+            with c2:
+                rel = st.text_input("Relation", value="relates_to")
+            with c3:
+                tgt = st.text_input("Target Memory ID")
+            
+            if st.form_submit_button("Create Edge"):
+                if src and tgt and rel:
+                    store.add_edge(src, tgt, rel)
+                    st.success("Edge created!")
+                    st.rerun()
+                else:
+                    st.error("All fields are required.")
+
     rows = store._conn.execute(
         """SELECT e.*, m1.content as source_content, m1.category as source_cat,
                   m2.content as target_content, m2.category as target_cat

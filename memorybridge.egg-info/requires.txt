@@ -1,0 +1,15 @@
+fastmcp<3.0.0,>=2.0.0
+tiktoken<1.0.0,>=0.7.0
+python-dotenv<2.0.0,>=1.0.0
+openai<3.0.0,>=1.0.0
+anthropic<1.0.0,>=0.20.0
+notion-client<4.0.0,>=2.2.0
+fastembed<1.0.0,>=0.2.0
+numpy<3.0.0,>=1.24.0
+streamlit<2.0.0,>=1.37.0
+pandas<3.0.0,>=2.0.0
+pyyaml<7.0,>=6.0
+
+[dev]
+pytest>=8.0
+pytest-mock>=3.12

@@ -92,11 +92,43 @@ def render():
                 expires_str = f" · Expires: {mem['expires_at'][:10]}" if mem.get("expires_at") else ""
                 st.markdown(f"`{mem.get('category', '')}` `{mem.get('importance', '')}` `Confidence: {conf_val:.2f}`{expires_str}")
                 st.caption(
-                    f"ID: {mem['id']} · "
+                    f"ID: `{mem['id']}` · "
                     f"Score: {mem.get('relevance_score', 0):.2f} · "
                     f"Accessed: {mem.get('access_count', 0)}× · "
-                    f"Created: {mem.get('created_at', '')}"
+                    f"Created: {mem.get('created_at', '')[:10]}"
                 )
+                
+                with st.expander("🕸️ Related Graph Edges"):
+                    edges = store.get_edges(mem["id"])
+                    if not edges:
+                        st.caption("No connected edges.")
+                    else:
+                        for e in edges:
+                            ec1, ec2 = st.columns([9, 1])
+                            is_source = (e["source_id"] == mem["id"])
+                            dir_icon = "→" if is_source else "←"
+                            other_id = e["target_id"] if is_source else e["source_id"]
+                            other_txt = (e.get("target_content") if is_source else e.get("source_content")) or "Deleted"
+                            with ec1:
+                                st.markdown(f"**{dir_icon} `{e['relation']}`** `{other_id}`")
+                                st.caption(f"{other_txt[:80]}...")
+                            with ec2:
+                                if st.button("✕", key=f"deledge_mb_{e['id']}_{mem['id']}", help="Delete edge"):
+                                    store.delete_edge(e["id"])
+                                    st.rerun()
+                    
+                    st.divider()
+                    st.caption("Add Outgoing Edge")
+                    ac1, ac2, ac3 = st.columns([3, 4, 2])
+                    with ac1:
+                        rel = st.text_input("Relation", value="relates_to", key=f"rel_{mem['id']}", label_visibility="collapsed")
+                    with ac2:
+                        tgt = st.text_input("Target ID", placeholder="Target Memory ID", key=f"tgt_{mem['id']}", label_visibility="collapsed")
+                    with ac3:
+                        if st.button("Add Edge", key=f"addedge_{mem['id']}"):
+                            if tgt:
+                                store.add_edge(mem["id"], tgt, rel)
+                                st.rerun()
             with col_del:
                 # Two-click confirmation + audit log. delete_memory is a hard
                 # DELETE with no undo, so a single misclick must not destroy a
