@@ -83,8 +83,8 @@ def test_embeddings_cached_not_recomputed(db, mocker):
     spy = mocker.spy(db, "_embed_texts")
     db.search_semantic("default", "military")
     db.search_semantic("default", "military")
-    # Two search calls → two embed_texts calls (one per query), but model loads once
-    assert spy.call_count == 2
+    # Two search calls, but query embedding is cached (LRU), so _embed_texts is called once.
+    assert spy.call_count == 1
     assert db._embed_model is not None, "Model should be cached after first call"
 
 

@@ -742,9 +742,10 @@ def search_memory(
     recency_boost: bool = True,
     include_related: bool = False,
     min_confidence: float = 0.0,
+    search_mode: str = "hybrid",
 ) -> str:
     """
-    Search memories using FTS5 BM25 with optional token budget.
+    Search memories using BM25, semantic, or hybrid (RRF) search.
 
     Args:
         query: Search query
@@ -764,12 +765,23 @@ def search_memory(
     if category and category not in VALID_CATEGORIES:
         return json.dumps({"error": f"Invalid category. Valid: {VALID_CATEGORIES}"})
 
-    # Phase 4: hybrid BM25 + semantic search (falls back to FTS5 if no embeddings built)
-    results = _store.search_hybrid(profile, query, category=category,
-                                   limit=limit, max_tokens=max_tokens,
-                                   recency_boost=recency_boost,
-                                   include_related=include_related,
-                                   min_confidence=min_confidence)
+    if search_mode not in ("hybrid", "keyword", "semantic"):
+        return json.dumps({"error": "Invalid search_mode. Use 'hybrid', 'keyword', or 'semantic'"})
+
+    if search_mode == "keyword":
+        results = _store.search(profile, query, category=category,
+                                limit=limit, max_tokens=max_tokens,
+                                recency_boost=recency_boost,
+                                include_related=include_related,
+                                min_confidence=min_confidence)
+    elif search_mode == "semantic":
+        results = _store.search_semantic(profile, query, limit=limit, max_tokens=max_tokens)
+    else:
+        results = _store.search_hybrid(profile, query, category=category,
+                                       limit=limit, max_tokens=max_tokens,
+                                       recency_boost=recency_boost,
+                                       include_related=include_related,
+                                       min_confidence=min_confidence)
 
     # Boost relevance score for all returned memories in a single commit (issue #12)
     _store.boost_batch(profile, [m["id"] for m in results],

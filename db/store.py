@@ -6,10 +6,11 @@ Tool signatures are unchanged — this is a drop-in persistence swap.
 
 import json
 import logging
-import os
 import sqlite3
 import threading
 import uuid
+import os
+import functools
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -189,6 +190,27 @@ def _unpack_vector(blob) -> list[float] | None:
     return None
 
 
+class _EmbeddingCache:
+    """Process-local cache of (profile -> (ids[], matrix)) for cosine search.
+    Invalidated by any write to the profile's memories."""
+    
+    def __init__(self):
+        self._cache = {}
+        self._lock = threading.Lock()
+    
+    def get(self, profile: str):
+        with self._lock:
+            return self._cache.get(profile)
+            
+    def set(self, profile: str, ids: list, matrix):
+        with self._lock:
+            self._cache[profile] = (ids, matrix)
+            
+    def invalidate(self, profile: str):
+        with self._lock:
+            self._cache.pop(profile, None)
+
+
 class MemoryStore:
     """
     SQLite-backed memory store with WAL mode, FTS5 search, and content-hash dedup.
@@ -233,6 +255,7 @@ class MemoryStore:
         # complete. Avoids backfill-on-next-startup for fast shutdowns.
         self._pending_embeds: set[threading.Thread] = set()
         self._pending_embed_lock = threading.Lock()
+        self._embedding_cache = _EmbeddingCache()
         db_path.parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=False is safe only because _LockedConnection
         # serializes every statement (issue #6).
@@ -455,6 +478,7 @@ class MemoryStore:
         # but before INSERT so we can redirect to UPDATE.
         merged_id = self._maybe_merge(profile, content, enriched_tags or [])
         if merged_id:
+            self._embedding_cache.invalidate(profile)
             return merged_id
 
         try:
@@ -484,6 +508,7 @@ class MemoryStore:
                     )
                 # FTS sync handled by memories_ai trigger (issue #3)
                 self._conn.commit()
+            self._embedding_cache.invalidate(profile)
             # Embed-on-write (issue #5): background thread so model load
             # doesn't block the MCP response. Tracked in _pending_embeds
             # so shutdown drains it before os._exit(0).
@@ -681,6 +706,7 @@ class MemoryStore:
 
         # Re-embed if content changed (fire-and-forget, fail-soft)
         if updated and "content" in fields:
+            self._embedding_cache.invalidate(profile)
             threading.Thread(
                 target=self._embed_one,
                 args=(memory_id, profile, fields["content"]),
@@ -713,6 +739,7 @@ class MemoryStore:
             # content (issue #3 — the old manual delete passed "" which
             # left ghost tokens in the index).
             self._conn.commit()
+        self._embedding_cache.invalidate(profile)
         return tc
 
     # -------------------------------------------------------------------------
@@ -845,6 +872,7 @@ class MemoryStore:
                     [(now_str, mid) for mid in to_archive]
                 )
                 self._conn.commit()
+            self._embedding_cache.invalidate(profile)
         return to_archive
 
     # -------------------------------------------------------------------------
@@ -1047,6 +1075,10 @@ class MemoryStore:
                         cache_dir=str(Path.home() / ".cache" / "fastembed"),
                     )
         return self._embed_model
+
+    @functools.lru_cache(maxsize=64)
+    def _embed_query_cached(self, query: str) -> list[float]:
+        return self._embed_texts([query])[0]
 
     def _embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Return list of 384-dim float vectors."""
@@ -1339,6 +1371,7 @@ class MemoryStore:
             [(mid, profile, _pack_vector(vec)) for mid, vec in zip(ids, vectors)]
         )
         self._conn.commit()
+        self._embedding_cache.invalidate(profile)
         return len(ids)
 
     def _cosine_similarity(self, a: list[float], b: list[float]) -> float:
@@ -1370,7 +1403,7 @@ class MemoryStore:
         # conflict detection and floods the store with duplicates. Degrade to
         # keyword/FTS search instead: weaker, but still catches duplicates.
         try:
-            q_vec = self._embed_texts([query])[0]
+            q_vec = self._embed_query_cached(query)
         except Exception as e:
             logger.error("Embedding model unavailable (%s) — falling back to "
                          "keyword search; semantic dedup is degraded.", e)
@@ -1394,26 +1427,37 @@ class MemoryStore:
         # Python-level cosine call per row (#54). Stale/unparseable vectors are
         # skipped (dimension guard, #52) so a model change can't crash search.
         import numpy as np
-        ids: list[str] = []
-        mat: list[list[float]] = []
-        mismatched = 0
-        for row in rows:
-            vec = _unpack_vector(row["vector"])
-            if not isinstance(vec, list) or len(vec) != q_len:
-                mismatched += 1
-                continue
-            ids.append(row["id"])
-            mat.append(vec)
+        
+        cached = self._embedding_cache.get(profile)
+        if cached is not None:
+            ids, M = cached
+            mismatched = 0
+        else:
+            ids: list[str] = []
+            mat: list[list[float]] = []
+            mismatched = 0
+            for row in rows:
+                vec = _unpack_vector(row["vector"])
+                if not isinstance(vec, list) or len(vec) != q_len:
+                    mismatched += 1
+                    continue
+                ids.append(row["id"])
+                mat.append(vec)
+            
+            if mat:
+                M = np.asarray(mat, dtype=np.float32)
+                self._embedding_cache.set(profile, ids, M)
+            else:
+                M = np.array([])
 
         scored = []
-        if mat:
+        if len(ids) > 0 and len(M) > 0:
             q = np.asarray(q_vec, dtype=np.float32)
             q_norm = float(np.linalg.norm(q))
             if q_norm > 0:
-                M = np.asarray(mat, dtype=np.float32)          # (n, d)
                 denom = np.linalg.norm(M, axis=1) * q_norm
                 sims = np.divide(M @ q, denom,
-                                 out=np.zeros(len(mat), dtype=np.float32),
+                                 out=np.zeros(len(M), dtype=np.float32),
                                  where=denom > 0)
                 scored = list(zip(ids, sims.tolist()))
 
@@ -1473,11 +1517,17 @@ class MemoryStore:
         entity-tag-related memories.
         *min_confidence* — filter out memories below confidence threshold.
         """
-        keyword_results = self.search(profile, query, category=category,
-                                      limit=limit * 2, max_tokens=max_tokens * 2,
-                                      min_confidence=min_confidence)
-        semantic_results = self.search_semantic(profile, query, limit=limit * 2,
-                                                max_tokens=max_tokens * 2)
+        import concurrent.futures
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            kw_future = pool.submit(self.search, profile, query, category=category,
+                                    limit=limit * 2, max_tokens=max_tokens * 2,
+                                    min_confidence=min_confidence)
+            sem_future = pool.submit(self.search_semantic, profile, query, limit=limit * 2,
+                                     max_tokens=max_tokens * 2)
+            
+            keyword_results = kw_future.result()
+            semantic_results = sem_future.result()
 
         scores: dict[str, float] = {}
         all_mems: dict[str, dict] = {}

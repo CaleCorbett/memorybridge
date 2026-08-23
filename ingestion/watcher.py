@@ -48,6 +48,9 @@ def detect_source(file_path: Path) -> str | None:
     Returns 'claude', 'chatgpt', 'gemini', or None if unrecognized.
     Returns None on any parse error — caller should move file to failed/.
     """
+    if file_path.suffix.lower() in ('.md', '.txt'):
+        return "document"
+
     try:
         with open(file_path, encoding="utf-8") as f:
             data = json.load(f)
@@ -150,6 +153,8 @@ def run_ingestion(source: str, file_path: Path, profile: str,
     ]
     if preview:
         cmd.append("--preview")
+    if source == "document":
+        cmd.append("--extract")
 
     logger.info("Running: %s", " ".join(cmd))
     # A large history can legitimately run long, so the timeout is generous and
@@ -201,11 +206,14 @@ def scan_inbox(inbox: Path, profile: str = "default", preview: bool = False,
     # symlink dropped in the inbox would be read and shipped inside an extraction
     # API prompt — arbitrary local file exfiltration. Only process regular files.
     regular = [f for f in inbox.iterdir() if f.is_file() and not f.is_symlink()]
-    files = sorted(f for f in regular if f.suffix.lower() == ".json")
-    # Non-.json files (e.g. a ChatGPT export .zip) were silently filtered out —
+    
+    _SUPPORTED_EXTS = {".json", ".md", ".txt"}
+    files = sorted(f for f in regular if f.suffix.lower() in _SUPPORTED_EXTS)
+    
+    # Unsupported files were silently filtered out —
     # not processed, not failed, not logged — so a user could drop one and wait
     # forever on an ingestion that never runs. Log-and-skip them explicitly (#117).
-    unknown = sorted(f for f in regular if f.suffix.lower() != ".json")
+    unknown = sorted(f for f in regular if f.suffix.lower() not in _SUPPORTED_EXTS)
 
     processed = 0
     failed = 0
@@ -214,7 +222,7 @@ def scan_inbox(inbox: Path, profile: str = "default", preview: bool = False,
     for f in unknown:
         logger.warning(
             "Ignoring %s — unsupported extension '%s'. Export your history as a "
-            "JSON file (unzip .zip archives to get conversations.json first).",
+            "JSON file or drop markdown documents.",
             f.name, f.suffix or "(none)")
         skipped += 1
 

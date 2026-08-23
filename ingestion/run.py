@@ -45,6 +45,7 @@ from parse_claude import parse as parse_claude
 from parse_chatgpt import parse as parse_chatgpt
 from parse_gemini import parse as parse_gemini
 from parse_hermes import parse as parse_hermes
+from parse_document import parse as parse_document
 from extractor import extract, ExtractionError
 from router import route
 from resolver import resolve
@@ -58,6 +59,7 @@ PARSERS = {
     "claude": parse_claude,
     "chatgpt": parse_chatgpt,
     "gemini": parse_gemini,
+    "document": parse_document,
 }
 
 MEMORYBRIDGE_DIR = _DATA_DIR
@@ -205,16 +207,15 @@ def _print_summary(report: dict, conv_count: int, flagged_count: int, elapsed: f
 def main():
     parser = argparse.ArgumentParser(description="MemoryBridge ingestion pipeline")
     parser.add_argument("--source", required=True,
-                        choices=["claude", "chatgpt", "gemini", "hermes"],
-                        help="Export source. claude/chatgpt/gemini are the "
-                             "standard exports; 'hermes' is an optional parser "
-                             "for the local Hermes agent DB.")
+                        choices=list(PARSERS.keys()),
+                        help="Export source (claude, chatgpt, gemini, hermes, document)")
     parser.add_argument("--file", default=None,
                         help="Path to the export file. Required for all sources "
                              "except 'hermes' (which defaults to "
                              "~/.hermes/state.db if --file is omitted).")
     parser.add_argument("--days", type=int, default=None, help="Only process last N days")
     parser.add_argument("--profile", default="default", help="Memory profile to write to")
+    parser.add_argument("--extract", action="store_true", help="DeepSeek extraction (for documents)")
     parser.add_argument("--preview", action="store_true", help="Dry run — no writes")
     args = parser.parse_args()
 
@@ -228,9 +229,24 @@ def main():
     # 1. Parse
     parse_fn = PARSERS[args.source]
     print(f"Parsing {args.source} export...")
-    normalized = parse_fn(args.file, days=args.days)
-    conv_count = len(normalized.get("conversations", []))
-    print(f"  Found {conv_count} conversations")
+    if args.source == "document":
+        candidates = parse_fn(args.file)
+        if args.extract:
+            convs = []
+            for i, c in enumerate(candidates):
+                convs.append({
+                    "id": f"{args.file}#sec{i}",
+                    "messages": [{"role": "user", "content": c["content"]}]
+                })
+            normalized = {"conversations": convs}
+            conv_count = len(convs)
+        else:
+            normalized = {"conversations": []}
+            conv_count = len(candidates)
+    else:
+        normalized = parse_fn(args.file, days=args.days)
+        conv_count = len(normalized.get("conversations", []))
+    print(f"  Found {conv_count} conversations/sections")
 
     # 1b. Idempotency (#45): skip conversations already ingested in a prior run
     # so a re-dropped export doesn't re-pay extraction or double-write. The set
@@ -275,12 +291,32 @@ def main():
                   "embeddings until build_embeddings is re-run.", file=sys.stderr)
 
     # 2. Extract
-    print("Extracting facts via DeepSeek R1...")
-    try:
-        facts, processed_convs = extract(normalized)
-    except ExtractionError as e:
-        print(f"Extraction failed: {e}", file=sys.stderr)
-        sys.exit(1)
+    if args.source == "document" and not args.extract:
+        print(f"Bypassing DeepSeek extraction for {args.source}...")
+        facts = []
+        for c in candidates:
+            facts.append({
+                "fact": c["content"],
+                "category": c["category"],
+                "importance": c["importance"],
+                "confidence": c["confidence"],
+                "why_it_matters": c.get("why_it_matters"),
+                "source_conversation_id": args.file,
+                "origin_file": args.file,
+                "origin_type": "document"
+            })
+        processed_convs = [{"id": args.file}]
+    else:
+        print("Extracting facts via DeepSeek R1...")
+        try:
+            facts, processed_convs = extract(normalized)
+        except ExtractionError as e:
+            print(f"Extraction failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        if args.source == "document":
+            for f in facts:
+                f["origin_file"] = args.file
+                f["origin_type"] = "document"
     print(f"  Extracted {len(facts)} candidate facts")
 
     if not facts:
