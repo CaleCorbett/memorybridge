@@ -52,7 +52,19 @@ CREATE TABLE IF NOT EXISTS memories (
     -- 2026 Memory Engineering additions (v5.0)
     confidence     REAL NOT NULL DEFAULT 1.0,
     expires_at     TEXT,
-    status         TEXT NOT NULL DEFAULT 'active'
+    status         TEXT NOT NULL DEFAULT 'active',
+    -- v5.1: Belief injection — instruction on HOW the model should use this fact.
+    -- Distinct from content (the fact itself). Not indexed by FTS5 because
+    -- searching instructions would return irrelevant hits.
+    why_it_matters TEXT,
+    -- v5.1: Enhanced provenance — where the memory originated.
+    -- origin_type: "manual" (MCP tool), "conversation" (ingestion pipeline),
+    --   "document" (doc/ADR ingestion), "consolidation" (session consolidation).
+    origin_type    TEXT,
+    origin_file    TEXT,       -- source file path, e.g. "docs/ADR-003.md"
+    -- v5.1: Edit history — JSON array of {ts, old_content, editor}.
+    -- Appended on every content change via edit_memory.
+    edit_history   TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_content_hash
@@ -112,8 +124,8 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-INSERT OR IGNORE INTO meta VALUES ('schema_version', '5.0');
-UPDATE meta SET value = '5.0' WHERE key = 'schema_version';
+INSERT OR IGNORE INTO meta VALUES ('schema_version', '5.1');
+UPDATE meta SET value = '5.1' WHERE key = 'schema_version';
 
 -- Phase 4: embedding vectors stored as packed float32 BLOBs (issue #181 P2-1).
 -- Previously JSON text, which cost ~81ms of json.loads() parsing per semantic

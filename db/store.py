@@ -384,7 +384,10 @@ class MemoryStore:
                    client_name: str | None = None,
                    confidence: float = 1.0,
                    expires_at: str | None = None,
-                   status: str = "active") -> str | None:
+                   status: str = "active",
+                   why_it_matters: str | None = None,
+                   origin_type: str | None = None,
+                   origin_file: str | None = None) -> str | None:
         """Returns memory ID on success, None if exact duplicate.
 
         Raises GuardrailRejection if content is document-shaped (too long, too
@@ -407,6 +410,16 @@ class MemoryStore:
         *client_name* — self-reported caller label (e.g. "hermes"), already
         sanitized by the caller (server.py's add_memory/add_memories tools).
         Unverified, unlike *source* — a caller can claim to be anything.
+
+        *why_it_matters* — optional instruction on HOW the model should act on
+        this fact (v5.1 belief injection). Stored alongside the fact but not
+        indexed by FTS5.
+
+        *origin_type* — how the memory entered the system: "manual", "conversation",
+        "document", "consolidation". None for legacy/unknown.
+
+        *origin_file* — source file path (e.g. "docs/ADR-003.md"). None for
+        manual writes.
         """
         if enforce_guardrail:
             ok, reason = guardrail_check(content)
@@ -452,11 +465,13 @@ class MemoryStore:
                     """INSERT INTO memories
                        (id,profile,content,content_hash,category,importance,
                         created_at,last_accessed,tags,project_id,token_count,source,client_name,
-                        confidence,expires_at,status)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        confidence,expires_at,status,
+                        why_it_matters,origin_type,origin_file)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (mid, profile, content, h, category, importance,
                      now, now, json.dumps(enriched_tags or []), project_id, tc, source, client_name,
-                     float(confidence), expires_at, status)
+                     float(confidence), expires_at, status,
+                     why_it_matters, origin_type, origin_file)
                 )
                 # Supersession: invalidate the facts this one replaces, in the
                 # same transaction so the swap is atomic (#temporal).
@@ -607,11 +622,12 @@ class MemoryStore:
     def edit_memory(self, profile: str, memory_id: str, **kwargs) -> bool:
         """Edit an existing memory in place. Only provided keyword fields are updated.
 
-        Supported kwargs: content, importance, category, project_id.
-        If content is provided, content_hash and token_count are recomputed.
+        Supported kwargs: content, importance, category, project_id, why_it_matters.
+        If content is provided, content_hash and token_count are recomputed, and
+        the old content is appended to edit_history (v5.1 provenance tracking).
         Returns True if the row was found and updated, False if not found.
         """
-        allowed = {"content", "importance", "category", "project_id"}
+        allowed = {"content", "importance", "category", "project_id", "why_it_matters"}
         fields = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
         if not fields:
             # Nothing to update — check existence and return
@@ -624,6 +640,25 @@ class MemoryStore:
         if "content" in fields:
             fields["content_hash"] = _content_hash(fields["content"])
             fields["token_count"] = _count_tokens(fields["content"])
+
+        # v5.1 edit history: on content change, record the old content before
+        # overwriting. Fetch the existing row to read old content + edit_history.
+        edit_history_update = False
+        if "content" in fields:
+            existing = self._conn.execute(
+                "SELECT content, edit_history, source FROM memories WHERE id=? AND profile=?",
+                (memory_id, profile)
+            ).fetchone()
+            if existing and existing["content"] != fields["content"]:
+                now = datetime.now().isoformat()
+                history = json.loads(existing["edit_history"] or "[]")
+                history.append({
+                    "ts": now,
+                    "old_content": existing["content"],
+                    "editor": existing["source"] or "unknown"
+                })
+                fields["edit_history"] = json.dumps(history)
+                edit_history_update = True
 
         set_clause = ", ".join(f"{col}=?" for col in fields)
         values = list(fields.values()) + [memory_id, profile]
@@ -1142,6 +1177,15 @@ class MemoryStore:
                 self._conn.execute("ALTER TABLE memories ADD COLUMN expires_at TEXT")
             if "status" not in cols:
                 self._conn.execute("ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+            # v5.1: Belief injection + provenance + edit history
+            if "why_it_matters" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN why_it_matters TEXT")
+            if "origin_type" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN origin_type TEXT")
+            if "origin_file" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN origin_file TEXT")
+            if "edit_history" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN edit_history TEXT NOT NULL DEFAULT '[]'")
             pruner_log_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(pruner_log)").fetchall()}
             if pruner_log_cols and "content" not in pruner_log_cols:
                 self._conn.execute("ALTER TABLE pruner_log ADD COLUMN content TEXT")
@@ -1510,6 +1554,11 @@ class MemoryStore:
         m = dict(row)
         if isinstance(m.get("tags"), str):
             m["tags"] = json.loads(m["tags"])
+        if isinstance(m.get("edit_history"), str):
+            try:
+                m["edit_history"] = json.loads(m["edit_history"])
+            except (json.JSONDecodeError, TypeError):
+                m["edit_history"] = []
         return m
 
     def _re_rank_by_recency(self, results: list[dict]) -> list[dict]:
@@ -1652,3 +1701,66 @@ class MemoryStore:
             deleted = cur.rowcount > 0
             self._conn.commit()
         return deleted
+
+    # -------------------------------------------------------------------------
+    # Provenance (v5.1)
+    # -------------------------------------------------------------------------
+
+    def get_provenance(self, memory_id: str) -> dict | None:
+        """Return full provenance chain for a memory.
+
+        Includes: origin (file, type, source, client_name), edit history,
+        supersession chain, and connected edges. Returns None if not found.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM memories WHERE id=?", (memory_id,)
+        ).fetchone()
+        if not row:
+            return None
+        mem = self._row_to_dict(row)
+
+        # Supersession chain: walk superseded_by forward
+        supersession_chain = []
+        if mem.get("superseded_by"):
+            successor = self._conn.execute(
+                "SELECT id, content, created_at FROM memories WHERE id=?",
+                (mem["superseded_by"],)
+            ).fetchone()
+            if successor:
+                supersession_chain.append({
+                    "id": successor["id"],
+                    "content": successor["content"],
+                    "created_at": successor["created_at"],
+                    "relation": "superseded_by"
+                })
+
+        # Also check if this memory superseded anything
+        predecessors = self._conn.execute(
+            "SELECT id, content, created_at, valid_until FROM memories WHERE superseded_by=?",
+            (memory_id,)
+        ).fetchall()
+        for p in predecessors:
+            supersession_chain.append({
+                "id": p["id"],
+                "content": p["content"],
+                "created_at": p["created_at"],
+                "valid_until": p["valid_until"],
+                "relation": "supersedes"
+            })
+
+        edges = self.get_edges(memory_id)
+
+        return {
+            "memory_id": memory_id,
+            "content": mem.get("content"),
+            "origin": {
+                "type": mem.get("origin_type"),
+                "file": mem.get("origin_file"),
+                "source": mem.get("source"),
+                "client_name": mem.get("client_name"),
+                "created_at": mem.get("created_at"),
+            },
+            "edit_history": mem.get("edit_history", []),
+            "supersession": supersession_chain,
+            "edges": edges,
+        }

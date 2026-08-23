@@ -285,7 +285,8 @@ def compress_memory(mem: dict, target_tokens: int = 50) -> dict:
 
 _RESULT_FIELDS = {"id", "content", "category", "importance",
                   "project_id", "tags", "token_count", "created_at", "client_name",
-                  "confidence", "expires_at", "status", "source"}
+                  "confidence", "expires_at", "status", "source",
+                  "why_it_matters", "origin_type", "origin_file"}
 
 
 def _clean_result(mem: dict) -> dict:
@@ -488,7 +489,8 @@ def add_memory(
     client_name: Optional[str] = None,
     confidence: float = 1.0,
     expires_at: Optional[str] = None,
-    status: str = "active"
+    status: str = "active",
+    why_it_matters: Optional[str] = None
 ) -> str:
     """
     Add a new memory with automatic token counting and content-hash dedup.
@@ -514,6 +516,8 @@ def add_memory(
         confidence: Confidence score between 0.0 and 1.0 (default 1.0)
         expires_at: Optional ISO timestamp when this memory expires (TTL)
         status: Status indicator (default 'active')
+        why_it_matters: Optional instruction on how the model should act on this
+            fact (e.g. "Format all responses as bullet lists")
     Returns:
         Confirmation with memory ID and token count, or duplicate status
     """
@@ -529,7 +533,9 @@ def add_memory(
                                 tags=tags, project_id=project_id,
                                 supersedes=supersedes, source=_caller_model(),
                                 client_name=_resolve_client_name(client_name),
-                                confidence=confidence, expires_at=expires_at, status=status)
+                                confidence=confidence, expires_at=expires_at, status=status,
+                                why_it_matters=why_it_matters,
+                                origin_type="manual")
     except GuardrailRejection as e:
         # Document-shaped content: return the structured error contract every
         # other validation path uses, instead of surfacing an unhandled MCP error.
@@ -621,7 +627,8 @@ def add_memories(
             mid = _store.add_memory(profile, fact,
                                     category=category, importance=importance,
                                     project_id=project, source=_caller_model(),
-                                    client_name=_resolve_client_name(client_name))
+                                    client_name=_resolve_client_name(client_name),
+                                    origin_type="manual")
         except GuardrailRejection as e:
             rejected.append({
                 "reason": str(e),
@@ -671,7 +678,8 @@ def edit_memory(
     importance: Optional[str] = None,
     category: Optional[str] = None,
     project: Optional[str] = None,
-    profile: str = None
+    profile: str = None,
+    why_it_matters: Optional[str] = None
 ) -> str:
     """
     Edit an existing memory in place by memory_id.
@@ -686,6 +694,7 @@ def edit_memory(
         category: New category (optional)
         project: New project association (optional)
         profile: Memory profile the memory belongs to
+        why_it_matters: Updated instruction on how the model should use this fact (optional)
     Returns:
         JSON confirmation, or {"error": ...} if memory_id not found / validation fails
     """
@@ -704,6 +713,8 @@ def edit_memory(
         kwargs["category"] = category
     if project is not None:
         kwargs["project_id"] = project
+    if why_it_matters is not None:
+        kwargs["why_it_matters"] = why_it_matters
 
     try:
         updated = _store.edit_memory(profile, memory_id, **kwargs)
@@ -931,6 +942,25 @@ def get_memory_edges(
 
 
 @mcp.tool()
+def get_memory_provenance(
+    memory_id: str
+) -> str:
+    """
+    Return the full provenance chain for a memory: origin, edit history,
+    supersession, and related edges. Useful for auditing how and where a
+    memory was created, what changed, and what it replaced.
+
+    Args:
+        memory_id: Memory ID to query
+    Returns:
+        JSON with origin, edit_history, supersession chain, and edges
+    """
+    provenance = _store.get_provenance(memory_id)
+    if provenance is None:
+        return json.dumps({"error": f"Memory '{memory_id}' not found"})
+    return json.dumps(provenance, indent=2)
+
+
 def delete_memory(
     memory_id: str,
     profile: str = None
