@@ -198,13 +198,18 @@ def resolve(escalated: list) -> list:
         logger.error("Cannot resolve escalated facts: %s", e)
         return [{**f, "verdict": "reject", "merged_fact": None} for f in escalated]
 
-    resolved = []
-    for fact in escalated:
+    import concurrent.futures
+
+    def resolve_fact(fact):
         try:
             verdict = _resolve_one(client, fact)
-            resolved.append({**fact, **verdict})
+            return {**fact, **verdict}
         except Exception as e:
             logger.error("Resolution failed for fact '%s...': %s — rejecting", fact.get("fact", "")[:40], e)
-            resolved.append({**fact, "verdict": "reject", "merged_fact": None})
+            return {**fact, "verdict": "reject", "merged_fact": None}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(escalated), 10)) as executor:
+        resolved = list(executor.map(resolve_fact, escalated))
 
     return resolved
+

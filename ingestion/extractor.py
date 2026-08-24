@@ -345,15 +345,20 @@ def extract(normalized: dict) -> tuple[list, list]:
         logger.info("Noise pre-screen dropped %d/%d conversations before extraction",
                     skipped_noise, len(conversations))
 
+    import concurrent.futures
+
     all_facts = []
     batches = [to_extract[i:i + _BATCH_SIZE] for i in range(0, len(to_extract), _BATCH_SIZE)]
     print(f"  [extract] {len(to_extract)} conversations -> ~{len(batches)} API "
           f"calls (batch size {_BATCH_SIZE})", file=sys.stderr, flush=True)
 
-    for batch_idx, batch in enumerate(batches):
+    if not batches:
+        return [], conversations
+
+
+    def extract_batch(batch_tuple):
+        batch_idx, batch = batch_tuple
         logger.info("Extracting batch %d/%d (%d conversations)", batch_idx + 1, len(batches), len(batch))
-        # Always-visible progress (logger is at WARNING in the CLI, so info()
-        # alone is invisible — this is what makes a long run observable).
         print(f"  [extract] batch {batch_idx + 1}/{len(batches)} "
               f"({len(batch)} conversations)...", file=sys.stderr, flush=True)
         try:
@@ -361,6 +366,7 @@ def extract(normalized: dict) -> tuple[list, list]:
         except Exception as e:
             raise ExtractionError(f"DeepSeek API unavailable: {e}") from e
 
+        batch_facts = []
         # Tag each fact with the first conversation id in the batch as a rough source
         for raw_fact in facts:
             # Validate/normalize first: drops non-dicts, empty text, and coerces
@@ -383,7 +389,13 @@ def extract(normalized: dict) -> tuple[list, list]:
                 # conversation (higher cost).
                 fact["source_conversation_id"] = ",".join(
                     str(c.get("id", "")) for c in batch if c.get("id"))
-            all_facts.append(fact)
+            batch_facts.append(fact)
+        return batch_facts
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(batches), 5)) as executor:
+        results = list(executor.map(extract_batch, enumerate(batches)))
+        for batch_facts in results:
+            all_facts.extend(batch_facts)
 
     # `conversations` here is the (possibly capped) list we actually
     # processed -- including any all-noise ones the pre-screen skipped
