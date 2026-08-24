@@ -45,15 +45,20 @@ def test_hybrid_outperforms_keyword_on_paraphrase(db):
     """Hybrid should surface semantic matches that pure keyword misses.
 
     Query 'monetary achievement' shares zero tokens with '$126M documented program impact'
-    (no stemming overlap either), so keyword returns nothing but semantic should fire.
+    (no stemming overlap either), so pure BM25 returns nothing but the hybrid semantic
+    leg should fire.
+
+    importance_boost=False isolates raw BM25 behaviour — the importance-boost second
+    pass (Fix 3) is designed for direct search() calls, not for this BM25-vs-hybrid
+    comparison.
     """
-    keyword_results = db.search("default", "monetary achievement")
+    keyword_results = db.search("default", "monetary achievement", importance_boost=False)
     keyword_contents = [r["content"] for r in keyword_results]
 
     hybrid_results = db.search_hybrid("default", "monetary achievement")
     hybrid_contents = [r["content"] for r in hybrid_results]
 
-    # Keyword must NOT find it (zero token overlap — confirms test is meaningful)
+    # Pure BM25 must NOT find it (zero token overlap — confirms test is meaningful)
     assert not any("126M" in c for c in keyword_contents), (
         "Keyword unexpectedly found '$126M' — choose a better zero-overlap query"
     )

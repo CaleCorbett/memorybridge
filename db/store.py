@@ -770,8 +770,20 @@ class MemoryStore:
         return mems
 
     def search(self, profile: str, query: str, category: str = None,
-               limit: int = 5, max_tokens: int = 800, min_confidence: float = 0.0) -> list[dict]:
-        """FTS5 BM25 search with token budget."""
+               limit: int = 5, max_tokens: int = 800, min_confidence: float = 0.0,
+               importance_boost: bool = True) -> list[dict]:
+        """FTS5 BM25 search with token budget.
+
+        When BM25 returns no active results the query is re-run against archived
+        memories so that queries using an obsolete term (e.g. an old employer
+        name) can surface the replacement belief via the counter-signal path
+        (Fix 4: counter-signal retrieval).
+
+        When *importance_boost* is True (default), a second pass queries the DB
+        for high-importance beliefs that fit in remaining budget but were not
+        returned by BM25 (Fix 3). Set to False in internal callers (e.g. the
+        search_hybrid BM25 leg) where the outer RRF ranking handles prioritisation.
+        """
         # Sanitize each term for FTS5
         terms = [t for t in query.split() if len(t) > 1]
         if not terms:
@@ -812,17 +824,88 @@ class MemoryStore:
             like_params.append(limit * 3)
             rows = self._conn.execute(like_sql, like_params).fetchall()
 
+        # Fix 4: counter-signal retrieval — when BM25 found nothing in active
+        # memories, check whether any archived (superseded) memories matched the
+        # query terms and, if so, surface their replacements. This ensures that
+        # querying an obsolete term (e.g. an old employer name) returns the
+        # current belief rather than an empty result set.
+        if not rows:
+            archived_rows = self._conn.execute(
+                "SELECT DISTINCT superseded_by FROM memories "
+                "WHERE profile=? AND archived=1 AND superseded_by IS NOT NULL "
+                "AND content LIKE ?",
+                (profile, f"%{query.split()[0]}%" if query.split() else "%")
+            ).fetchall()
+            replacement_ids = [
+                r["superseded_by"] for r in archived_rows if r["superseded_by"]
+            ]
+            if replacement_ids:
+                placeholders = ",".join("?" * len(replacement_ids))
+                repl_rows = self._conn.execute(
+                    f"SELECT * FROM memories WHERE id IN ({placeholders}) AND archived=0",
+                    replacement_ids
+                ).fetchall()
+                counter_results = []
+                for row in repl_rows:
+                    m = self._row_to_dict(row)
+                    # match_score=0.0: no direct token hit; counter_signal marks
+                    # the result as retrieved via supersession chain, not BM25.
+                    m["match_score"] = 0.0
+                    m["counter_signal"] = True
+                    counter_results.append(m)
+                return counter_results
+
+        # Main token-budget trim: walk ranked list in BM25 order, admitting
+        # memories until the budget is exhausted.
+        pre_trim: list[dict] = []
         results, tokens_used = [], 0
         for row in rows:
             m = self._row_to_dict(row)
             m.pop("bm25_score", None)
             m["match_score"] = _jaccard_similarity(query, m["content"])
+            pre_trim.append(m)
             if tokens_used + m["token_count"] <= max_tokens:
                 results.append(m)
                 tokens_used += m["token_count"]
             if len(results) >= limit:
                 break
+
+        # Fix 3: importance-aware budget second pass — after the main BM25 trim,
+        # query the DB directly for high-importance beliefs that fit in the
+        # remaining budget but were not already admitted. This covers the case
+        # where a high-importance belief had zero token overlap with the query
+        # (BM25 never returned it) but should still be surfaced because it fits
+        # and the caller has capacity left.
+        # Disabled (importance_boost=False) for internal search_hybrid calls that
+        # run their own RRF-based prioritisation over both legs.
+        admitted_ids = {m["id"] for m in results}
+        remaining = max_tokens - tokens_used
+        if importance_boost and remaining > 0 and len(results) < limit:
+            now_str2 = datetime.now().isoformat()
+            high_rows = self._conn.execute(
+                "SELECT * FROM memories "
+                "WHERE profile=? AND archived=0 AND importance='high' "
+                "  AND token_count <= ? "
+                "  AND (expires_at IS NULL OR expires_at > ?) "
+                "  AND confidence >= ? "
+                "ORDER BY relevance_score DESC "
+                "LIMIT ?",
+                (profile, remaining, now_str2, min_confidence, limit * 2)
+            ).fetchall()
+            for row in high_rows:
+                m = self._row_to_dict(row)
+                if m["id"] in admitted_ids:
+                    continue
+                if tokens_used + m["token_count"] <= max_tokens:
+                    m["match_score"] = _jaccard_similarity(query, m["content"])
+                    results.append(m)
+                    tokens_used += m["token_count"]
+                    admitted_ids.add(m["id"])
+                if len(results) >= limit:
+                    break
+
         return results
+
 
     def boost_batch(self, profile: str, ids: list,
                     boost: float = 0.1) -> None:
@@ -1385,7 +1468,8 @@ class MemoryStore:
         return float(np.dot(va, vb) / denom) if denom > 0 else 0.0
 
     def search_semantic(self, profile: str, query: str,
-                        limit: int = 5, max_tokens: int = 800) -> list[dict]:
+                        limit: int = 5, max_tokens: int = 800,
+                        min_confidence: float = 0.0) -> list[dict]:
         """
         Vector cosine-similarity search against stored embeddings.
         Falls back to FTS5 if no embeddings have been built for this profile.
@@ -1395,7 +1479,8 @@ class MemoryStore:
             "SELECT COUNT(*) FROM memory_embeddings WHERE profile=?", (profile,)
         ).fetchone()[0]
         if count == 0:
-            return self.search(profile, query, limit=limit, max_tokens=max_tokens)
+            return self.search(profile, query, limit=limit, max_tokens=max_tokens,
+                               min_confidence=min_confidence)
 
         # Embed query. If the embedding model can't load (fastembed missing,
         # download failed), DON'T let the exception propagate — callers (merger,
@@ -1407,7 +1492,8 @@ class MemoryStore:
         except Exception as e:
             logger.error("Embedding model unavailable (%s) — falling back to "
                          "keyword search; semantic dedup is degraded.", e)
-            return self.search(profile, query, limit=limit, max_tokens=max_tokens)
+            return self.search(profile, query, limit=limit, max_tokens=max_tokens,
+                               min_confidence=min_confidence)
         q_len = len(q_vec)
 
         # Fetch embedding rows for profile, joined against memories to exclude
@@ -1415,11 +1501,13 @@ class MemoryStore:
         # via normal reads (archived=0 is hardcoded on every read path) but
         # their embeddings were still being loaded and scored on every
         # semantic search — pure wasted work once a memory is archived.
+        # Fix 1: min_confidence — filter embeddings belonging to low-confidence
+        # memories so the semantic leg honours the same quality bar as BM25.
         rows = self._conn.execute(
             "SELECT e.id, e.vector FROM memory_embeddings e "
             "JOIN memories m ON m.id = e.id "
-            "WHERE e.profile=? AND m.archived=0",
-            (profile,)
+            "WHERE e.profile=? AND m.archived=0 AND m.confidence >= ?",
+            (profile, min_confidence)
         ).fetchall()
 
         # Score by cosine similarity. Collect usable same-dimension vectors into
@@ -1469,7 +1557,8 @@ class MemoryStore:
         if not scored:
             # Every stored vector is unusable (e.g. model changed) — don't return
             # an empty result set; degrade to keyword/FTS search.
-            return self.search(profile, query, limit=limit, max_tokens=max_tokens)
+            return self.search(profile, query, limit=limit, max_tokens=max_tokens,
+                               min_confidence=min_confidence)
 
         # Sort descending by similarity
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -1522,9 +1611,11 @@ class MemoryStore:
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             kw_future = pool.submit(self.search, profile, query, category=category,
                                     limit=limit * 2, max_tokens=max_tokens * 2,
-                                    min_confidence=min_confidence)
+                                    min_confidence=min_confidence,
+                                    importance_boost=False)
             sem_future = pool.submit(self.search_semantic, profile, query, limit=limit * 2,
-                                     max_tokens=max_tokens * 2)
+                                     max_tokens=max_tokens * 2,
+                                     min_confidence=min_confidence)
             
             keyword_results = kw_future.result()
             semantic_results = sem_future.result()
@@ -1536,6 +1627,13 @@ class MemoryStore:
         for rank, mem in enumerate(keyword_results):
             mid = mem["id"]
             scores[mid] = scores.get(mid, 0.0) + 1.0 / (60 + rank)
+            # Fix 2: BM25 rank-0 tiebreak — a belief that holds the top BM25
+            # slot has exact surface-term precision that the semantic leg cannot
+            # provide for near-identical-vector cases (identity-discrimination).
+            # Add an additive boost equal to one RRF slot (1/60 ≈ 0.0167) so
+            # it wins ties against semantically adjacent but wrong beliefs.
+            if rank == 0:
+                scores[mid] += 1.0 / 60
             all_mems[mid] = mem
 
         for rank, mem in enumerate(semantic_results):
