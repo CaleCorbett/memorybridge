@@ -93,15 +93,15 @@ def _seed_noise_corpus(store):
     )
     d1 = store.add_memory(
         "default", "The user cat is named Mochi and is a tabby",
-        category="fact", importance="low",
+        category="fact", importance="low", confidence=0.5,
     )
     d2 = store.add_memory(
         "default", "The user wants to try a new pasta recipe this weekend",
-        category="fact", importance="low",
+        category="fact", importance="low", confidence=0.5,
     )
     d3 = store.add_memory(
         "default", "The user favorite vacation destination is Kyoto Japan",
-        category="fact", importance="low",
+        category="fact", importance="low", confidence=0.5,
     )
     return {"target": target, "drift": [d1, d2, d3]}
 
@@ -330,16 +330,8 @@ class TestNoiseIsolation:
         assert len(drift_returned) > 0, "Expected drift contamination to be observed"
 
     @pytest.mark.skipif(not _EMBED_AVAILABLE, reason="Requires embedding model")
-    @pytest.mark.xfail(
-        reason=(
-            "PROPOSED FIX not implemented: search_semantic currently ignores "
-            "min_confidence. Adding this filter would exclude low-importance "
-            "drift memories that have importance='low' (lower initial confidence)."
-        ),
-        strict=True,
-    )
     def test_proposed__min_confidence_in_semantic_excludes_drift(self, tmp_path):
-        """PROPOSED: min_confidence parameter in search_semantic excludes low-importance drift."""
+        """PROPOSED (Fix 1 verified): min_confidence parameter in search_semantic excludes low-importance drift."""
         store = _make_store(tmp_path)
         ids = _seed_noise_corpus(store)
         store.build_embeddings("default")

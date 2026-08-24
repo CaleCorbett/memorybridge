@@ -191,7 +191,7 @@ def _unpack_vector(blob) -> list[float] | None:
 
 
 class _EmbeddingCache:
-    """Process-local cache of (profile -> (ids[], matrix)) for cosine search.
+    """Process-local cache of (profile -> (ids[], confidences[], matrix)) for cosine search.
     Invalidated by any write to the profile's memories."""
     
     def __init__(self):
@@ -202,9 +202,9 @@ class _EmbeddingCache:
         with self._lock:
             return self._cache.get(profile)
             
-    def set(self, profile: str, ids: list, matrix):
+    def set(self, profile: str, ids: list, confidences: list[float], matrix):
         with self._lock:
-            self._cache[profile] = (ids, matrix)
+            self._cache[profile] = (ids, confidences, matrix)
             
     def invalidate(self, profile: str):
         with self._lock:
@@ -1501,13 +1501,12 @@ class MemoryStore:
         # via normal reads (archived=0 is hardcoded on every read path) but
         # their embeddings were still being loaded and scored on every
         # semantic search — pure wasted work once a memory is archived.
-        # Fix 1: min_confidence — filter embeddings belonging to low-confidence
-        # memories so the semantic leg honours the same quality bar as BM25.
+        # Query confidence as well to do query-time filtering.
         rows = self._conn.execute(
-            "SELECT e.id, e.vector FROM memory_embeddings e "
+            "SELECT e.id, e.vector, m.confidence FROM memory_embeddings e "
             "JOIN memories m ON m.id = e.id "
-            "WHERE e.profile=? AND m.archived=0 AND m.confidence >= ?",
-            (profile, min_confidence)
+            "WHERE e.profile=? AND m.archived=0",
+            (profile,)
         ).fetchall()
 
         # Score by cosine similarity. Collect usable same-dimension vectors into
@@ -1518,10 +1517,11 @@ class MemoryStore:
         
         cached = self._embedding_cache.get(profile)
         if cached is not None:
-            ids, M = cached
+            ids, confidences, M = cached
             mismatched = 0
         else:
             ids: list[str] = []
+            confidences: list[float] = []
             mat: list[list[float]] = []
             mismatched = 0
             for row in rows:
@@ -1530,24 +1530,36 @@ class MemoryStore:
                     mismatched += 1
                     continue
                 ids.append(row["id"])
+                confidences.append(float(row["confidence"]))
                 mat.append(vec)
             
             if mat:
                 M = np.asarray(mat, dtype=np.float32)
-                self._embedding_cache.set(profile, ids, M)
+                self._embedding_cache.set(profile, ids, confidences, M)
             else:
                 M = np.array([])
 
-        scored = []
+        # Filter by min_confidence using the cached/queried confidences list
         if len(ids) > 0 and len(M) > 0:
+            keep_idx = [i for i, conf in enumerate(confidences) if conf >= min_confidence]
+            if not keep_idx:
+                return []
+            ids_filtered = [ids[i] for i in keep_idx]
+            M_filtered = M[keep_idx]
+        else:
+            ids_filtered = []
+            M_filtered = np.array([])
+
+        scored = []
+        if len(ids_filtered) > 0 and len(M_filtered) > 0:
             q = np.asarray(q_vec, dtype=np.float32)
             q_norm = float(np.linalg.norm(q))
             if q_norm > 0:
-                denom = np.linalg.norm(M, axis=1) * q_norm
-                sims = np.divide(M @ q, denom,
-                                 out=np.zeros(len(M), dtype=np.float32),
+                denom = np.linalg.norm(M_filtered, axis=1) * q_norm
+                sims = np.divide(M_filtered @ q, denom,
+                                 out=np.zeros(len(M_filtered), dtype=np.float32),
                                  where=denom > 0)
-                scored = list(zip(ids, sims.tolist()))
+                scored = list(zip(ids_filtered, sims.tolist()))
 
         if mismatched:
             logger.warning(

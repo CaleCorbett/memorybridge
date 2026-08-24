@@ -56,10 +56,17 @@ def _resolve(rel_path: str) -> Path:
     return candidate
 
 
-def _is_write_allowed(rel_path: str) -> bool:
-    """Deny-by-default: only paths matching a `workspace_write_allowed` prefix."""
+def _is_write_allowed(target: Path) -> bool:
+    """Deny-by-default: only paths residing within a `workspace_write_allowed` directory."""
+    root = config.workspace_root().resolve()
     allowed = config.load_config().get("workspace_write_allowed", [])
-    return any(rel_path.startswith(prefix) for prefix in allowed)
+    for prefix in allowed:
+        # Resolve the allowed prefix relative to the workspace root
+        prefix_path = (root / prefix).resolve()
+        # Check if the resolved target path is relative to the resolved prefix path
+        if target.is_relative_to(prefix_path):
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -110,14 +117,15 @@ def ws_write(path: str, content: str, overwrite: bool = False) -> dict:
     """
     if _REMOTE_MODE and not overwrite:
         return {"error": "remote writes require overwrite=True"}
-    if not _is_write_allowed(path):
-        return {"error": f"write not allowed under path: {path}"}
     target = _resolve(path)
+    if not _is_write_allowed(target):
+        return {"error": f"write not allowed under path: {path}"}
     if target.exists() and not overwrite:
         return {"error": f"exists, pass overwrite=True to replace: {path}"}
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
     return {"path": path, "bytes_written": len(content.encode("utf-8"))}
+
 
 
 def ws_search(query: str, path: str = "") -> dict:

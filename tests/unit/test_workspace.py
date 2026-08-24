@@ -121,6 +121,13 @@ def test_write_to_disallowed_folder_blocked(_isolated_workspace_root, allow_note
     assert not (_isolated_workspace_root / "secrets" / "creds.txt").exists()
 
 
+def test_write_bypass_via_traversal_blocked(_isolated_workspace_root, allow_notes):
+    result = workspace.ws_write("notes/../escaped.txt", "pwned")
+    assert "error" in result
+    assert not (_isolated_workspace_root / "escaped.txt").exists()
+
+
+
 def test_remote_write_without_overwrite_blocked(_isolated_workspace_root, allow_notes, monkeypatch):
     monkeypatch.setattr(workspace, "_REMOTE_MODE", True)
     result = workspace.ws_write("notes/new.txt", "content")
