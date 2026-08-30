@@ -21,6 +21,7 @@ ingestion/notion_context.py
 ingestion/notion_queue.py
 ingestion/parse_chatgpt.py
 ingestion/parse_claude.py
+ingestion/parse_document.py
 ingestion/parse_gemini.py
 ingestion/parse_hermes.py
 ingestion/passport.py

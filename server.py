@@ -973,6 +973,7 @@ def get_memory_provenance(
     return json.dumps(provenance, indent=2)
 
 
+@mcp.tool()
 def delete_memory(
     memory_id: str,
     profile: str = None
@@ -1637,7 +1638,13 @@ def _gate_tools_for_remote() -> list[str]:
     """
     try:
         import asyncio
-        tool_names = list(asyncio.run(mcp.get_tools()).keys())
+        if hasattr(mcp, "list_tools"):
+            tools = asyncio.run(mcp.list_tools())
+            tool_names = [t.name if hasattr(t, "name") else str(t) for t in tools]
+        elif hasattr(mcp, "get_tools"):
+            tool_names = list(asyncio.run(mcp.get_tools()).keys())
+        else:
+            raise RuntimeError("Unknown FastMCP tool enumeration method")
     except Exception as e:
         # Do NOT fall back to a private FastMCP attribute — a rename there
         # would silently yield an empty set and serve every tool (fail-open).
@@ -1654,7 +1661,10 @@ def _gate_tools_for_remote() -> list[str]:
     for name in tool_names:
         if name not in REMOTE_ALLOWED_TOOLS:
             try:
-                mcp.remove_tool(name)
+                if hasattr(mcp, "local_provider") and hasattr(mcp.local_provider, "remove_tool"):
+                    mcp.local_provider.remove_tool(name)
+                else:
+                    mcp.remove_tool(name)
                 removed.append(name)
             except Exception as e:
                 print(f"[memorybridge] FATAL: could not remove tool {name}: {e}",
@@ -1829,6 +1839,12 @@ def _run_http() -> None:
               f"tools gated: removed {len(removed)} ({', '.join(sorted(removed))})",
               file=sys.stderr)
         mcp.run(transport="http", host="127.0.0.1", port=port, path=mcp_path)
+
+
+# Backward compatibility for .fn access in tests and modules across FastMCP 2.x and 3.x
+for _tool_name, _tool_obj in list(globals().items()):
+    if callable(_tool_obj) and hasattr(_tool_obj, "__fastmcp__") and not hasattr(_tool_obj, "fn"):
+        setattr(_tool_obj, "fn", _tool_obj)
 
 
 if __name__ == "__main__":

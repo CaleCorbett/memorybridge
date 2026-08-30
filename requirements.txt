@@ -3,9 +3,8 @@
 # anchored to the versions this code is known to run against (fastmcp 2.x,
 # streamlit 1.5x, openai 2.x, numpy 2.x). Bump a cap deliberately after testing.
 #
-# fastmcp: the server/UI touch the 2.x-only `.fn` tool attribute, so this must
-# stay on the 2.x line — NOT the old floor of 0.1.0 which allowed 1.x.
-fastmcp>=2.0.0,<3.0.0
+# fastmcp: updated to >=3.2.0 to resolve CVE-2026-32871, CVE-2026-32870, CVE-2026-32869, and transitive DiskCache CVE-2025-69872.
+fastmcp>=3.2.0,<4.0.0
 tiktoken>=0.7.0,<1.0.0
 python-dotenv>=1.0.0,<2.0.0
 openai>=1.0.0,<3.0.0

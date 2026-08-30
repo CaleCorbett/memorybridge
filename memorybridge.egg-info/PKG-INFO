@@ -13,7 +13,7 @@ Classifier: Operating System :: OS Independent
 Requires-Python: >=3.11
 Description-Content-Type: text/markdown
 License-File: LICENSE
-Requires-Dist: fastmcp<3.0.0,>=2.0.0
+Requires-Dist: fastmcp<4.0.0,>=3.2.0
 Requires-Dist: tiktoken<1.0.0,>=0.7.0
 Requires-Dist: python-dotenv<2.0.0,>=1.0.0
 Requires-Dist: openai<3.0.0,>=1.0.0
